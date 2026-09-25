@@ -16,14 +16,19 @@ Requires the `core`, `asteroid-layer`, and `hoki-hybris-layer` collections,
 Whinlatter, and the upstream layers required by those recipes. It does not
 depend on meta-nereid or select its custom UI.
 
-## Current integration contract
+## GPS builds
 
-This layer is extracted from 0x53A/asteroid-watch's meta-hoki-local. It preserves
-the existing integration rather than converting external inputs to source recipes.
-Check it out beside `hoki-location/`; its recipes consume the backend source and
-locally built helper binaries there. The root repository's `tools/build-hoki.sh`
-builds and synchronizes those inputs. A standalone layer clone is not enough
-to build GPS. Hardware fixes remain scoped as in the original layer.
+The GPS helpers, GeoClue backend, vendor headers and tests are source files in
+[recipes-hoki/hoki-location/files/hoki-location](recipes-hoki/hoki-location/files/hoki-location/README.md).
+BitBake builds the helpers with a pinned Android NDK native toolchain and fetched
+Android 9 libc++ headers. android-system-data stages checksummed link libraries
+from its existing upstream Hoki archive. No sibling project, local SDK or
+precompiled helper is required. The NDK toolchain currently requires an x86-64
+Linux build host.
+
+```sh
+bitbake hoki-location geoclue-provider-hybris-binder
+```
 
 PulseAudio hardware configuration is here; AirPlay and session-lifetime policy
 are in meta-nereid. Source patches and existing authorship are preserved.

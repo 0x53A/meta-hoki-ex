@@ -1,7 +1,7 @@
 # Keep upstream's package/D-Bus identity, replace its backend only on Hoki.
-FILESEXTRAPATHS:prepend := "${THISDIR}/files:${THISDIR}/../../../hoki-location/backend:"
+FILESEXTRAPATHS:prepend := "${THISDIR}/files:${THISDIR}/../../recipes-hoki/hoki-location/files/hoki-location/backend:"
 SRC_URI:append:hoki = " file://0001-hoki-location-api-backend.patch file://locationapibackend.h file://locationapibackend.cpp file://locationprotocol.h file://locationapibackend.pro file://locationbackendfactory.cpp"
-PR:append:hoki = ".hoki4"
+PR:append:hoki = ".hoki5"
 SUMMARY:hoki = "GeoClue provider with isolated Hoki LocationAPI backend"
 QMAKE_PROFILES:hoki = "${S}/hoki/locationapibackend.pro"
 DEPENDS:remove:hoki = "libhybris libgbinder libglibutil glib-2.0"

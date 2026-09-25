@@ -5,3 +5,4 @@ __pycache__/
 /recipes-hoki/hoki-health-recorder/files/health-recorder-runtime.tar.gz*
 /recipes-connectivity/ble-ssh/files/ble-ssh-runtime.tar.gz*
 /recipes-connectivity/acoustic-link/files/acoustic-link-runtime.tar.gz*
+/build/

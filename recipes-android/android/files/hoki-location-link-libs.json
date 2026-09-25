@@ -1,0 +1,22 @@
+{
+  "liblocation_api.so": {
+    "source": "vendor/lib/liblocation_api.so",
+    "size": 79948,
+    "sha256": "882508aac34a4286213ccff261230c91da0b2ee9f0dd38a064e3e89111868123"
+  },
+  "libc++.so": {
+    "source": "system/lib/libc++.so",
+    "size": 640424,
+    "sha256": "2ec15c6a808ec5099af2aceaa923edf1be8d212fc001c7af461e9d50fac17152"
+  },
+  "libdl.so": {
+    "source": "system/lib/libdl.so",
+    "size": 10064,
+    "sha256": "9807bc310d9d2bd366fc292bea290622f1e8153eba5b7cb49219b6ce3f1e7e62"
+  },
+  "liblog.so": {
+    "source": "system/lib/liblog.so",
+    "size": 89004,
+    "sha256": "5b8f6f158a2f620d184332705b082cf47a1402759b7f1eee7011899d389d8987"
+  }
+}
