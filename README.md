@@ -1,3 +1,10 @@
+<p align="center">
+  <img src="assets/certified-slop.svg" alt="100% Certified Slop" width="640">
+</p>
+
+> [!NOTE]
+> This project was largely LLM generated.
+
 # Hoki hardware extensions
 
 Additional Fossil Gen 6 (Hoki) hardware support on top of AsteroidOS
