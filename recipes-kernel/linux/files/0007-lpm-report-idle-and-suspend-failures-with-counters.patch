@@ -1,0 +1,111 @@
+Subject: [PATCH] cpuidle: qcom: report aborted idle and failed suspend entry
+
+Preserve cleanup while reporting negative entry results. Do not add
+aborted CPU idle entries to prediction history. Expose separate read-
+only counters for scheduler aborts, entry failures and unavailable
+suspend modes.
+
+Upstream-Status: Pending
+
+---
+diff --git a/drivers/cpuidle/lpm-levels.c b/drivers/cpuidle/lpm-levels.c
+--- a/drivers/cpuidle/lpm-levels.c
++++ b/drivers/cpuidle/lpm-levels.c
+@@ -32,6 +32,7 @@
+ #include <linux/smp.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/moduleparam.h>
++#include <linux/atomic.h>
+ #include <linux/sched.h>
+ #include <linux/cpu_pm.h>
+ #include <linux/cpuhotplug.h>
+@@ -140,6 +141,31 @@
+ static bool sleep_disabled;
+ module_param_named(sleep_disabled, sleep_disabled, bool, 0664);
+ 
++/* Read-only entry failure counts; no logging from the idle path. */
++static atomic64_t idle_resched_aborts = ATOMIC64_INIT(0);
++static atomic64_t idle_entry_failures = ATOMIC64_INIT(0);
++static atomic64_t suspend_no_mode = ATOMIC64_INIT(0);
++static atomic64_t suspend_entry_failures = ATOMIC64_INIT(0);
++
++static int entry_failure_count_get(char *buffer, const struct kernel_param *kp)
++{
++	return scnprintf(buffer, PAGE_SIZE, "%lld\n",
++			(long long)atomic64_read(kp->arg));
++}
++
++static const struct kernel_param_ops entry_failure_count_ops = {
++	.get = entry_failure_count_get,
++};
++
++module_param_cb(idle_resched_aborts, &entry_failure_count_ops,
++		&idle_resched_aborts, 0444);
++module_param_cb(idle_entry_failures, &entry_failure_count_ops,
++		&idle_entry_failures, 0444);
++module_param_cb(suspend_no_mode, &entry_failure_count_ops,
++		&suspend_no_mode, 0444);
++module_param_cb(suspend_entry_failures, &entry_failure_count_ops,
++		&suspend_entry_failures, 0444);
++
+ /**
+  * msm_cpuidle_get_deep_idle_latency - Get deep idle latency value
+  *
+@@ -1503,10 +1529,14 @@
+ 	trace_cpu_idle_enter(idx);
+ 	lpm_stats_cpu_enter(idx, start_time);
+ 
+-	if (need_resched())
++	if (need_resched()) {
++		atomic64_inc(&idle_resched_aborts);
+ 		goto exit;
++	}
+ 
+ 	success = psci_enter_sleep(cpu, idx, true);
++	if (!success)
++		atomic64_inc(&idle_entry_failures);
+ 
+ exit:
+ 	end_time = ktime_to_ns(ktime_get());
+@@ -1515,7 +1545,8 @@
+ 	cluster_unprepare(cpu->parent, cpumask, idx, true, end_time, success);
+ 	cpu_unprepare(cpu, idx, true);
+ 	dev->last_residency = ktime_us_delta(ktime_get(), start);
+-	update_history(dev, idx);
++	if (success)
++		update_history(dev, idx);
+ 	trace_cpu_idle_exit(idx, success);
+ 	if (lpm_prediction && cpu->lpm_prediction) {
+ 		histtimer_cancel();
+@@ -1526,7 +1557,7 @@
+ 		cpu->bias = 0;
+ 	}
+ 	local_irq_enable();
+-	return idx;
++	return success ? idx : -EBUSY;
+ }
+ 
+ static void lpm_cpuidle_s2idle(struct cpuidle_device *dev,
+@@ -1773,17 +1804,19 @@
+ 			break;
+ 	}
+ 	if (idx < 0) {
+-		pr_err("Failed suspend\n");
+-		return 0;
++		atomic64_inc(&suspend_no_mode);
++		return -EINVAL;
+ 	}
+ 	cpu_prepare(lpm_cpu, idx, false);
+ 	cluster_prepare(cluster, cpumask, idx, false, 0);
+ 
+ 	success = psci_enter_sleep(lpm_cpu, idx, false);
++	if (!success)
++		atomic64_inc(&suspend_entry_failures);
+ 
+ 	cluster_unprepare(cluster, cpumask, idx, false, 0, success);
+ 	cpu_unprepare(lpm_cpu, idx, false);
+-	return 0;
++	return success ? 0 : -EBUSY;
+ }
+ 
+ static const struct platform_suspend_ops lpm_suspend_ops = {

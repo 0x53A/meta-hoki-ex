@@ -1,0 +1,35 @@
+Subject: [PATCH] pin the selected BSS when the driver cannot resolve optional PMF
+
+For normal scan-based association with optional PMF, a driver lacking optional
+MFP support cannot select between APs requiring different concrete MFP policies.
+Pin the already selected BSS in that case and resolve PMF from its RSN IE.
+
+Keep interface-wide BSS-selection and roaming capabilities intact. Non-optional
+PMF connections and drivers supporting optional MFP retain their existing BSS
+selection behavior. Explicit ap_scan=2 selection is unchanged. Also resolve PMF
+when a BSSID is explicitly pinned: no other AP can be selected for that request.
+
+Upstream-Status: Pending
+
+--- a/wpa_supplicant/wpa_supplicant.c
++++ b/wpa_supplicant/wpa_supplicant.c
+@@ -4317,6 +4317,9 @@
+ 		params.ssid = bss->ssid;
+ 		params.ssid_len = bss->ssid_len;
+ 		if (!wpas_driver_bss_selection(wpa_s) || ssid->bssid_set ||
++		    (wpa_s->conf->ap_scan == 1 &&
++		     wpas_get_ssid_pmf(wpa_s, ssid) == MGMT_FRAME_PROTECTION_OPTIONAL &&
++		     !(wpa_s->drv_flags & WPA_DRIVER_FLAGS_MFP_OPTIONAL)) ||
+ 		    wpa_s->key_mgmt == WPA_KEY_MGMT_WPS) {
+ 			wpa_printf(MSG_DEBUG, "Limit connection to BSSID "
+ 				   MACSTR " freq=%u MHz based on scan results "
+@@ -4499,7 +4502,8 @@
+ 	if (params.mgmt_frame_protection != NO_MGMT_FRAME_PROTECTION && bss) {
+ 		const u8 *rsn = wpa_bss_get_ie(bss, WLAN_EID_RSN);
+ 		struct wpa_ie_data ie;
+-		if (!wpas_driver_bss_selection(wpa_s) && rsn &&
++		/* A pinned BSSID lets us resolve PMF even with firmware selection. */
++		if ((!wpas_driver_bss_selection(wpa_s) || params.bssid) && rsn &&
+ 		    wpa_parse_wpa_ie(rsn, 2 + rsn[1], &ie) == 0 &&
+ 		    ie.capabilities &
+ 		    (WPA_CAPABILITY_MFPC | WPA_CAPABILITY_MFPR)) {

@@ -1,0 +1,75 @@
+From: Hoki integration <code@lukasrieger.com>
+Subject: [PATCH] Add isolated Hoki LocationAPI backend and backend status reporting
+
+Upstream-Status: Inappropriate [Hoki vendor ABI integration]
+
+--- a/hybrisprovider.h
++++ b/hybrisprovider.h
+@@ -120,6 +120,7 @@
+     void timerEvent(QTimerEvent *event);
+ 
+ private slots:
++    void backendStatus(int status);
+     void setLocation(const Location &location);
+     void setSatellite(const QList<SatelliteInfo> &satellites, const QList<int> &used);
+     void serviceUnregistered(const QString &service);
+@@ -173,11 +174,11 @@
+ 
+     Location m_currentLocation;
+ 
+-    qint64 m_satelliteTimestamp;
++    qint64 m_satelliteTimestamp = 0;
+     QList<SatelliteInfo> m_visibleSatellites;
+     QList<int> m_usedPrns;
+ 
+-    qint64 m_previousSatelliteTimestamp;
++    qint64 m_previousSatelliteTimestamp = 0;
+     QList<SatelliteInfo> m_previousVisibleSatellites;
+     QList<int> m_previousUsedPrns;
+ 
+--- a/hybrisprovider.cpp
++++ b/hybrisprovider.cpp
+@@ -513,7 +513,7 @@
+     m_previousVisibleSatellites = m_visibleSatellites;
+     m_previousUsedPrns = m_usedPrns;
+ 
+-    m_satelliteTimestamp = QDateTime::currentMSecsSinceEpoch();
++    m_satelliteTimestamp = QDateTime::currentSecsSinceEpoch();
+     m_visibleSatellites = satellites;
+     m_usedPrns = used;
+     emitSatelliteChanged();
+@@ -851,6 +851,18 @@
+     }
+ }
+ 
++void HybrisProvider::backendStatus(int status)
++{
++    if (status < StatusError || status > StatusAvailable) return;
++    if (status != StatusAvailable) {
++        m_fixLostTimer.stop();
++        m_currentLocation = Location();
++        m_visibleSatellites.clear(); m_usedPrns.clear(); m_satelliteTimestamp = 0;
++        emitLocationChanged(); emitSatelliteChanged();
++    }
++    setStatus(static_cast<Status>(status));
++}
++
+ void HybrisProvider::engineOn()
+ {
+     qCDebug(lcGeoclueHybris) << "Engine on";
+@@ -1052,8 +1064,13 @@
+         return;
+ 
+     // Positioning enabled externally and positioning is still being used.
+-    if (positioningEnabled() && !m_watchedServices.isEmpty())
+-        return;
++    if (positioningEnabled() && !m_watchedServices.isEmpty()) {
++        if (m_backend) m_backend->gnssSetPositionMode(
++            m_agpsEnabled ? HYBRIS_GNSS_POSITION_MODE_MS_BASED : HYBRIS_GNSS_POSITION_MODE_STANDALONE,
++            HYBRIS_GNSS_POSITION_RECURRENCE_PERIODIC, minimumRequestedUpdateInterval(),
++            PreferredAccuracy, PreferredInitialFixTime);
++        return;
++    }
+ 
+     // Stop listening to all PositionChanged signals from org.freedesktop.Geoclue.Position
+     // interfaces.

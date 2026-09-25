@@ -1,0 +1,51 @@
+From: Hoki local integration
+Subject: [PATCH] prima: initialize and drain station remain-on-channel work
+
+The remain-on-channel path accepts infrastructure station adapters and can
+defer their listen requests while associated. Initialize the delayed work
+before publishing the station netdev and include it in the existing ROC
+drain on adapter stop, as for P2P clients/devices.
+
+Upstream-Status: Pending
+
+--- a/CORE/HDD/src/wlan_hdd_main.c
++++ b/CORE/HDD/src/wlan_hdd_main.c
+@@ -10217,6 +10217,12 @@
+          mutex_unlock(&pHddCtx->tdls_lock);
+ #endif
+ 
++         /* Station interfaces can also carry P2P discovery/listen requests.
++          * Initialize before registering the netdev, just like P2P adapters.
++          */
++         vos_init_delayed_work(&pAdapter->roc_work,
++                 hdd_p2p_roc_work_queue);
++
+          hdd_initialize_adapter_common(pAdapter);
+ 
+          status = hdd_register_interface( pAdapter, rtnl_held );
+@@ -10245,14 +10251,6 @@
+          //netif_tx_disable(pWlanDev);
+          netif_carrier_off(pAdapter->dev);
+ 
+-         if (WLAN_HDD_P2P_CLIENT == session_type ||
+-                 WLAN_HDD_P2P_DEVICE == session_type)
+-         {
+-             /* Initialize the work queue to defer the
+-              * back to back RoC request */
+-             vos_init_delayed_work(&pAdapter->roc_work,
+-                     hdd_p2p_roc_work_queue);
+-         }
+ 
+          break;
+       }
+@@ -10946,8 +10944,8 @@
+          {
+             wlan_hdd_scan_abort(pAdapter);
+          }
+-       if ((pAdapter->device_mode != WLAN_HDD_INFRA_STATION) &&
+-                   (pAdapter->device_mode != WLAN_HDD_IBSS))
++       /* Drain station ROC work too before its SME session is closed. */
++       if (pAdapter->device_mode != WLAN_HDD_IBSS)
+        {
+           while (pAdapter->is_roc_inprogress)
+           {

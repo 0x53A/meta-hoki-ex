@@ -1,0 +1,68 @@
+Subject: [PATCH] NFC: nci: complete exchanges before callbacks and consume failed sends
+
+A response callback can wake an AF_NFC reader before NCI clears its busy
+flag. Release the completed transaction before delivering its response.
+Also consume the socket-owned skb on every early transceive failure so a
+rejected send cannot retain the socket and its active target indefinitely.
+
+Upstream-Status: Pending
+
+diff --git a/net/nfc/nci/core.c b/net/nfc/nci/core.c
+index c25e9b4179c3..0b0f754a9af1 100644
+--- a/net/nfc/nci/core.c
++++ b/net/nfc/nci/core.c
+@@ -1007,4 +1007,6 @@ static int nci_transceive(struct nfc_dev *nfc_dev, struct nfc_target *target,
+ 	conn_info = ndev->rf_conn_info;
+-	if (!conn_info)
+-		return -EPROTO;
++	if (!conn_info) {
++		rc = -EPROTO;
++		goto free_skb;
++	}
+ 
+@@ -1014,7 +1016,10 @@ static int nci_transceive(struct nfc_dev *nfc_dev, struct nfc_target *target,
+ 		pr_err("unable to exchange data, no active target\n");
+-		return -EINVAL;
++		rc = -EINVAL;
++		goto free_skb;
+ 	}
+ 
+-	if (test_and_set_bit(NCI_DATA_EXCHANGE, &ndev->flags))
+-		return -EBUSY;
++	if (test_and_set_bit(NCI_DATA_EXCHANGE, &ndev->flags)) {
++		rc = -EBUSY;
++		goto free_skb;
++	}
+ 
+@@ -1029,2 +1034,7 @@ static int nci_transceive(struct nfc_dev *nfc_dev, struct nfc_target *target,
+ 	return rc;
++
++free_skb:
++	/* nfc_data_exchange transfers ownership even when submission fails. */
++	kfree_skb(skb);
++	return rc;
+ }
+diff --git a/net/nfc/nci/data.c b/net/nfc/nci/data.c
+index 5405d073804c..781a90ae5a91 100644
+--- a/net/nfc/nci/data.c
++++ b/net/nfc/nci/data.c
+@@ -47,3 +47,4 @@ void nci_data_exchange_complete(struct nci_dev *ndev, struct sk_buff *skb,
+ 		kfree_skb(skb);
+-		goto exit;
++		clear_bit(NCI_DATA_EXCHANGE, &ndev->flags);
++		return;
+ 	}
+@@ -59,2 +60,7 @@ void nci_data_exchange_complete(struct nci_dev *ndev, struct sk_buff *skb,
+ 
++	/* The callback can wake a reader which immediately starts another
++	 * exchange. Publish completion before delivering the response.
++	 */
++	clear_bit_unlock(NCI_DATA_EXCHANGE, &ndev->flags);
++
+ 	if (cb) {
+@@ -68,5 +74,2 @@ void nci_data_exchange_complete(struct nci_dev *ndev, struct sk_buff *skb,
+ 	}
+-
+-exit:
+-	clear_bit(NCI_DATA_EXCHANGE, &ndev->flags);
+ }

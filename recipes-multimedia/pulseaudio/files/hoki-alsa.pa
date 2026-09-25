@@ -1,0 +1,8 @@
+# The DSP copy path cannot rewind. Guard exceeds its maximum 983040-byte ring.
+# Hoki has no droid audio module. The speaker route is set by
+# hoki-speaker-routing.service; use the tested write-based PCM path.
+load-module module-alsa-sink device=hw:0,0 mmap=false tsched=false sink_name=hoki_speaker rewind_safeguard=1048576
+# The built-in microphone is mono. Select it explicitly so capture clients do
+# not fall back to the speaker's monitor source.
+load-module module-alsa-source device=hw:0,0 channels=1 channel_map=mono rate=48000 format=s16le mmap=false tsched=false source_name=hoki_microphone
+set-default-source hoki_microphone

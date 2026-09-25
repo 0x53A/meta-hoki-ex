@@ -1,0 +1,79 @@
+From: Hoki local integration <code@lukasrieger.com>
+Subject: [PATCH] pcm: detect legacy SYNC_PTR on 32-bit time64 userspace
+
+Retry only ENOTTY with the kernel's legacy structure and explicitly convert
+returned timestamps, state and pointers. Cache successful fallback per device;
+retain the public time64 ABI and leave other ioctls/errors untouched.
+
+Upstream-Status: Pending
+
+--- a/src/pcm_hw.c
++++ b/src/pcm_hw.c
+@@ -54,6 +54,8 @@
+     unsigned int device;
+     /** File descriptor to the pcm device file node */
+     int fd;
++    /** Legacy SYNC_PTR capability, learned separately for each open device. */
++    int sync_ptr_legacy;
+     /** Pointer to the pcm node from snd card definiton */
+     struct snd_node *node;
+ };
+@@ -68,6 +70,39 @@
+     free(hw_data);
+ }
+ 
++/* A time64 userspace may run on a kernel predating the time64 PCM ABI.
++ * Keep the public time64 structures; translate only at the ioctl boundary.
++ * The kernel UAPI supplies both layouts on 32-bit time64 builds.
++ */
++#if defined(__SND_STRUCT_TIME64) && __SIZEOF_LONG__ == 4
++static int pcm_hw_sync_ptr_legacy(struct pcm_hw_data *hw_data,
++                                  struct snd_pcm_sync_ptr *ptr)
++{
++    struct __snd_pcm_sync_ptr legacy;
++    int ret;
++
++    memset(&legacy, 0, sizeof(legacy));
++    legacy.flags = ptr->flags;
++    legacy.c.control.appl_ptr = ptr->c.control.appl_ptr;
++    legacy.c.control.avail_min = ptr->c.control.avail_min;
++    ret = ioctl(hw_data->fd, _IOWR('A', 0x23, struct __snd_pcm_sync_ptr), &legacy);
++    if (ret < 0)
++        return ret;
++
++    ptr->s.status.state = legacy.s.status.state;
++    ptr->s.status.hw_ptr = legacy.s.status.hw_ptr;
++    ptr->s.status.tstamp.tv_sec = legacy.s.status.tstamp.tv_sec;
++    ptr->s.status.tstamp.tv_nsec = legacy.s.status.tstamp.tv_nsec;
++    ptr->s.status.suspended_state = legacy.s.status.suspended_state;
++    ptr->s.status.audio_tstamp.tv_sec = legacy.s.status.audio_tstamp.tv_sec;
++    ptr->s.status.audio_tstamp.tv_nsec = legacy.s.status.audio_tstamp.tv_nsec;
++    ptr->c.control.appl_ptr = legacy.c.control.appl_ptr;
++    ptr->c.control.avail_min = legacy.c.control.avail_min;
++    hw_data->sync_ptr_legacy = 1;
++    return ret;
++}
++#endif
++
+ static int pcm_hw_ioctl(void *data, unsigned int cmd, ...)
+ {
+     struct pcm_hw_data *hw_data = data;
+@@ -78,6 +113,18 @@
+     arg = va_arg(ap, void *);
+     va_end(ap);
+ 
++#if defined(__SND_STRUCT_TIME64) && __SIZEOF_LONG__ == 4
++    if (cmd == SNDRV_PCM_IOCTL_SYNC_PTR) {
++        int ret;
++        if (hw_data->sync_ptr_legacy)
++            return pcm_hw_sync_ptr_legacy(hw_data, arg);
++        ret = ioctl(hw_data->fd, cmd, arg);
++        /* Other failures are real errors, not evidence of an older ABI. */
++        if (ret >= 0 || errno != ENOTTY)
++            return ret;
++        return pcm_hw_sync_ptr_legacy(hw_data, arg);
++    }
++#endif
+     return ioctl(hw_data->fd, cmd, arg);
+ }
+ 

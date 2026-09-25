@@ -1,0 +1,29 @@
+From: Hoki local maintainers <code@lukasrieger.com>
+Subject: [PATCH] soc: qcom: bgcom: recover from resume timeout without BUG
+
+A Blackghost subsystem restart can enter runtime resume while the peripheral
+is unavailable. After 100 failed polls bgcom_resume_l() calls BUG(), killing
+the application processor before its existing soft-reset/error path runs.
+
+Keep the bounded timeout, diagnostic GPIO reads, soft reset and -ETIMEDOUT
+return. Remove the unconditional fatal assertion: a peripheral failing to
+wake is not an unrecoverable kernel invariant violation.
+
+Observed on Hoki kernel 4.14.206 after restarting the Sidekick HAL: the
+failure diagnostics are immediately followed by an undefined-instruction
+Oops in bgcom_resume_l on ssr_wq. This fixes that explicit panic path; it does
+not establish why the peripheral originally stopped responding.
+
+Upstream-Status: Pending
+---
+--- a/drivers/soc/qcom/bgcom_spi.c
++++ b/drivers/soc/qcom/bgcom_spi.c
+@@ -573,7 +573,7 @@
+ 				__func__, gpio_get_value(95));
+ 		pr_err("%s: gpio#97 value is: %d\n",
+ 				__func__, gpio_get_value(97));
+-		BUG();
++		/* A peripheral timeout must not crash the application processor. */
+ 		bg_soft_reset();
+ 		return -ETIMEDOUT;
+ 	}

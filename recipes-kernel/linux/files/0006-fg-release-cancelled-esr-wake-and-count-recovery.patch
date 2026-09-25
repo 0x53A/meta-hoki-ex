@@ -1,0 +1,112 @@
+Subject: [PATCH] power: supply: qcom: balance canceled software ESR wake ownership
+
+Quiesce alarm and worker producers during USB transitions before
+releasing the wake reason of canceled pending work. Count corrective
+releases through an optional read-only diagnostic file.
+
+Upstream-Status: Pending
+
+---
+diff --git a/drivers/power/supply/qcom/fg-core.h b/drivers/power/supply/qcom/fg-core.h
+--- a/drivers/power/supply/qcom/fg-core.h
++++ b/drivers/power/supply/qcom/fg-core.h
+@@ -500,6 +500,8 @@
+ 	struct delayed_work	profile_load_work;
+ 	struct work_struct	status_change_work;
+ 	struct work_struct	esr_sw_work;
++	bool			esr_sw_canceling;
++	atomic_t		esr_sw_cancelled_wake_count;
+ 	struct delayed_work	sram_dump_work;
+ 	struct work_struct	esr_filter_work;
+ 	struct alarm		esr_filter_alarm;
+diff --git a/drivers/power/supply/qcom/qpnp-fg-gen3.c b/drivers/power/supply/qcom/qpnp-fg-gen3.c
+--- a/drivers/power/supply/qcom/qpnp-fg-gen3.c
++++ b/drivers/power/supply/qcom/qpnp-fg-gen3.c
+@@ -2645,9 +2645,10 @@
+ 	fg_get_sram_prop(fg, FG_SRAM_ESR, &esr_uohms);
+ 	fg_dbg(fg, FG_STATUS, "SW ESR done ESR=%d\n", esr_uohms);
+ 
+-	/* restart the alarm timer */
+-	alarm_start_relative(&fg->esr_sw_timer,
+-		ms_to_ktime(fg->esr_wakeup_ms));
++	/* A USB transition may have canceled this measurement. */
++	if (!READ_ONCE(fg->esr_sw_canceling) && READ_ONCE(fg->usb_present))
++		alarm_start_relative(&fg->esr_sw_timer,
++			ms_to_ktime(fg->esr_wakeup_ms));
+ done:
+ 	rc = fg_sram_masked_write(fg, ESR_EXTRACTION_ENABLE_WORD,
+ 			ESR_EXTRACTION_ENABLE_OFFSET,
+@@ -2665,8 +2666,13 @@
+ {
+ 	struct fg_dev *fg = container_of(alarm,
+ 			struct fg_dev, esr_sw_timer);
+-
+-	if (!fg->usb_present)
++	unsigned long flags;
++	bool skip;
++
++	spin_lock_irqsave(&fg->awake_lock, flags);
++	skip = fg->esr_sw_canceling || !fg->usb_present;
++	spin_unlock_irqrestore(&fg->awake_lock, flags);
++	if (skip)
+ 		return ALARMTIMER_NORESTART;
+ 
+ 	fg_stay_awake(fg, FG_SW_ESR_WAKE);
+@@ -2678,6 +2684,8 @@
+ static int fg_config_esr_sw(struct fg_dev *fg)
+ {
+ 	int rc;
++	unsigned long flags;
++	bool cancelled, esr_wake_owned;
+ 	union power_supply_propval prop = {0, };
+ 	struct fg_gen3_chip *chip = container_of(fg, struct fg_gen3_chip, fg);
+ 
+@@ -2695,12 +2703,29 @@
+ 	}
+ 
+ 	if (fg->usb_present != prop.intval) {
+-		fg->usb_present = prop.intval;
++		spin_lock_irqsave(&fg->awake_lock, flags);
++		fg->esr_sw_canceling = true;
++		WRITE_ONCE(fg->usb_present, prop.intval);
++		spin_unlock_irqrestore(&fg->awake_lock, flags);
+ 		fg_dbg(fg, FG_STATUS, "USB status changed=%d\n",
+ 						fg->usb_present);
+ 		/* cancel any pending work */
+ 		alarm_cancel(&fg->esr_sw_timer);
+-		cancel_work_sync(&fg->esr_sw_work);
++		cancelled = cancel_work_sync(&fg->esr_sw_work);
++		/* ESR producers stay gated until cancellation is complete. */
++		spin_lock_irqsave(&fg->awake_lock, flags);
++		esr_wake_owned = fg->awake_status & FG_SW_ESR_WAKE;
++		spin_unlock_irqrestore(&fg->awake_lock, flags);
++		if (cancelled && esr_wake_owned) {
++			/* Release the canceled worker's wake reason. */
++			fg_relax(fg, FG_SW_ESR_WAKE);
++			atomic_inc(&fg->esr_sw_cancelled_wake_count);
++		}
++		/* A worker can rearm the alarm after the first cancellation. */
++		alarm_cancel(&fg->esr_sw_timer);
++		spin_lock_irqsave(&fg->awake_lock, flags);
++		fg->esr_sw_canceling = false;
++		spin_unlock_irqrestore(&fg->awake_lock, flags);
+ 
+ 		if (fg->usb_present) {
+ 			/* disable ESR extraction across the charging cycle */
+@@ -5508,6 +5533,7 @@
+ 	INIT_DELAYED_WORK(&chip->pl_enable_work, pl_enable_work);
+ 	INIT_WORK(&fg->status_change_work, status_change_work);
+ 	INIT_WORK(&fg->esr_sw_work, fg_esr_sw_work);
++	atomic_set(&fg->esr_sw_cancelled_wake_count, 0);
+ 	INIT_DELAYED_WORK(&chip->ttf_work, ttf_work);
+ 	INIT_DELAYED_WORK(&fg->sram_dump_work, sram_dump_work);
+ 	INIT_WORK(&fg->esr_filter_work, esr_filter_work);
+@@ -5595,6 +5621,8 @@
+ 			rc);
+ 		goto exit;
+ 	}
++	debugfs_create_atomic_t("esr_sw_cancelled_wake_count", 0444,
++				fg->dfs_root, &fg->esr_sw_cancelled_wake_count);
+ 
+ 	rc = fg_get_battery_voltage(fg, &volt_uv);
+ 	if (!rc)

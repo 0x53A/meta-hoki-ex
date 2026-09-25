@@ -1,0 +1,119 @@
+Subject: [PATCH] power: supply: qcom: fix FG shadow retry outcomes
+
+Accept a matching final attempt and reject exhausted mismatches. Add
+optional read-only counters for both formerly incorrect outcomes; rate
+limit errors.
+
+Upstream-Status: Pending
+
+---
+diff --git a/drivers/power/supply/qcom/fg-core.h b/drivers/power/supply/qcom/fg-core.h
+--- a/drivers/power/supply/qcom/fg-core.h
++++ b/drivers/power/supply/qcom/fg-core.h
+@@ -445,6 +445,11 @@
+ 	struct votable		*delta_bsoc_irq_en_votable;
+ 	struct votable		*batt_miss_irq_en_votable;
+ 	struct fg_sram_param	*sp;
++	/* Shadow-copy read diagnostics; zero-initialized with fg_dev. */
++	atomic_t		ibatt_last_match_count;
++	atomic_t		ibatt_exhausted_count;
++	atomic_t		vbatt_last_match_count;
++	atomic_t		vbatt_exhausted_count;
+ 	struct fg_memif		sram;
+ 	struct fg_alg_flag	*alg_flags;
+ 	int			*debug_mask;
+diff --git a/drivers/power/supply/qcom/fg-util.c b/drivers/power/supply/qcom/fg-util.c
+--- a/drivers/power/supply/qcom/fg-util.c
++++ b/drivers/power/supply/qcom/fg-util.c
+@@ -990,11 +990,12 @@
+ #define BATT_CURRENT_DENR	1000
+ int fg_get_battery_current(struct fg_dev *fg, int *val)
+ {
+-	int rc = 0, tries = 0;
++	int rc, tries;
+ 	int64_t temp = 0;
+ 	u8 buf[2], buf_cp[2];
++	bool matched = false;
+ 
+-	while (tries++ < MAX_READ_TRIES) {
++	for (tries = 0; tries < MAX_READ_TRIES; tries++) {
+ 		rc = fg_read(fg, BATT_INFO_IBATT_LSB(fg), buf, 2);
+ 		if (rc < 0) {
+ 			pr_err("failed to read addr=0x%04x, rc=%d\n",
+@@ -1009,14 +1010,19 @@
+ 			return rc;
+ 		}
+ 
+-		if (buf[0] == buf_cp[0] && buf[1] == buf_cp[1])
++		if (buf[0] == buf_cp[0] && buf[1] == buf_cp[1]) {
++			matched = true;
+ 			break;
++		}
+ 	}
+ 
+-	if (tries == MAX_READ_TRIES) {
+-		pr_err("IBATT: shadow registers do not match\n");
++	if (!matched) {
++		atomic_inc(&fg->ibatt_exhausted_count);
++		pr_err_ratelimited("IBATT: shadow registers do not match\n");
+ 		return -EINVAL;
+ 	}
++	if (tries == MAX_READ_TRIES - 1)
++		atomic_inc(&fg->ibatt_last_match_count);
+ 
+ 	if (fg->wa_flags & PMI8998_V1_REV_WA)
+ 		temp = buf[0] << 8 | buf[1];
+@@ -1034,11 +1040,12 @@
+ #define BATT_VOLTAGE_DENR	1000
+ int fg_get_battery_voltage(struct fg_dev *fg, int *val)
+ {
+-	int rc = 0, tries = 0;
++	int rc, tries;
+ 	u16 temp = 0;
+ 	u8 buf[2], buf_cp[2];
++	bool matched = false;
+ 
+-	while (tries++ < MAX_READ_TRIES) {
++	for (tries = 0; tries < MAX_READ_TRIES; tries++) {
+ 		rc = fg_read(fg, BATT_INFO_VBATT_LSB(fg), buf, 2);
+ 		if (rc < 0) {
+ 			pr_err("failed to read addr=0x%04x, rc=%d\n",
+@@ -1053,14 +1060,19 @@
+ 			return rc;
+ 		}
+ 
+-		if (buf[0] == buf_cp[0] && buf[1] == buf_cp[1])
++		if (buf[0] == buf_cp[0] && buf[1] == buf_cp[1]) {
++			matched = true;
+ 			break;
++		}
+ 	}
+ 
+-	if (tries == MAX_READ_TRIES) {
+-		pr_err("VBATT: shadow registers do not match\n");
++	if (!matched) {
++		atomic_inc(&fg->vbatt_exhausted_count);
++		pr_err_ratelimited("VBATT: shadow registers do not match\n");
+ 		return -EINVAL;
+ 	}
++	if (tries == MAX_READ_TRIES - 1)
++		atomic_inc(&fg->vbatt_last_match_count);
+ 
+ 	if (fg->wa_flags & PMI8998_V1_REV_WA)
+ 		temp = buf[0] << 8 | buf[1];
+@@ -1685,6 +1697,15 @@
+ 			goto err_remove_fs;
+ 		}
+ 	}
++	/* Diagnostic files are optional and must not fail FG probe. */
++	debugfs_create_atomic_t("ibatt_last_match_count", 0400, fg->dfs_root,
++				&fg->ibatt_last_match_count);
++	debugfs_create_atomic_t("ibatt_exhausted_count", 0400, fg->dfs_root,
++				&fg->ibatt_exhausted_count);
++	debugfs_create_atomic_t("vbatt_last_match_count", 0400, fg->dfs_root,
++				&fg->vbatt_last_match_count);
++	debugfs_create_atomic_t("vbatt_exhausted_count", 0400, fg->dfs_root,
++				&fg->vbatt_exhausted_count);
+ 
+ 	return 0;
+ 

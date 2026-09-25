@@ -1,0 +1,171 @@
+From: Hoki local integration <code@lukasrieger.com>
+Subject: [PATCH] pcm: detect legacy SYNC_PTR on 32-bit time64 userspace
+
+Cover SYNC_PTR, STATUS and STATUS_EXT. Retain the public time64 ABI and translate
+only after the modern ioctl returns
+ENOTTY. Cache a successful legacy fallback per PCM handle and preserve errors.
+
+Upstream-Status: Pending
+
+--- a/src/pcm/pcm_hw.c
++++ b/src/pcm/pcm_hw.c
+@@ -97,6 +97,8 @@
+ 	bool mmap_status_fallbacked;
+ 	bool mmap_control_fallbacked;
+ 	struct snd_pcm_sync_ptr *sync_ptr;
++	bool sync_ptr_legacy;
++	unsigned int status_legacy_mask;
+ 
+ 	bool prepare_reset_sw_params;
+ 	bool perfect_drain;
+@@ -139,11 +141,56 @@
+ }
+ #endif /* DOC_HIDDEN */
+ 
++/* A time64 userspace may run on a kernel predating the time64 PCM ABI.
++ * Keep the public time64 structures; translate only at the ioctl boundary.
++ * The kernel UAPI supplies both layouts on 32-bit time64 builds.
++ */
++#if defined(__SND_STRUCT_TIME64) && __SIZEOF_LONG__ == 4
++static int snd_pcm_hw_sync_ptr_legacy(snd_pcm_hw_t *hw,
++                                  struct snd_pcm_sync_ptr *ptr)
++{
++    struct __snd_pcm_sync_ptr legacy;
++    int ret;
++
++    memset(&legacy, 0, sizeof(legacy));
++    legacy.flags = ptr->flags;
++    legacy.c.control.appl_ptr = ptr->c.control.appl_ptr;
++    legacy.c.control.avail_min = ptr->c.control.avail_min;
++    ret = ioctl(hw->fd, _IOWR('A', 0x23, struct __snd_pcm_sync_ptr), &legacy);
++    if (ret < 0)
++        return ret;
++
++    ptr->s.status.state = legacy.s.status.state;
++    ptr->s.status.hw_ptr = legacy.s.status.hw_ptr;
++    ptr->s.status.tstamp.tv_sec = legacy.s.status.tstamp.tv_sec;
++    ptr->s.status.tstamp.tv_nsec = legacy.s.status.tstamp.tv_nsec;
++    ptr->s.status.suspended_state = legacy.s.status.suspended_state;
++    ptr->s.status.audio_tstamp.tv_sec = legacy.s.status.audio_tstamp.tv_sec;
++    ptr->s.status.audio_tstamp.tv_nsec = legacy.s.status.audio_tstamp.tv_nsec;
++    ptr->c.control.appl_ptr = legacy.c.control.appl_ptr;
++    ptr->c.control.avail_min = legacy.c.control.avail_min;
++    hw->sync_ptr_legacy = 1;
++    return ret;
++}
++#endif
++
+ static int sync_ptr1(snd_pcm_hw_t *hw, unsigned int flags)
+ {
+-	int err;
++	int err, result;
++
+ 	hw->sync_ptr->flags = flags;
+-	if (ioctl(hw->fd, SNDRV_PCM_IOCTL_SYNC_PTR, hw->sync_ptr) < 0) {
++#if defined(__SND_STRUCT_TIME64) && __SIZEOF_LONG__ == 4
++	if (hw->sync_ptr_legacy) {
++		result = snd_pcm_hw_sync_ptr_legacy(hw, hw->sync_ptr);
++	} else {
++		result = ioctl(hw->fd, SNDRV_PCM_IOCTL_SYNC_PTR, hw->sync_ptr);
++		if (result < 0 && errno == ENOTTY)
++			result = snd_pcm_hw_sync_ptr_legacy(hw, hw->sync_ptr);
++	}
++#else
++	result = ioctl(hw->fd, SNDRV_PCM_IOCTL_SYNC_PTR, hw->sync_ptr);
++#endif
++	if (result < 0) {
+ 		err = -errno;
+ 		SYSMSG("SNDRV_PCM_IOCTL_SYNC_PTR failed (%i)", err);
+ 		return err;
+@@ -602,18 +649,88 @@
+ 	return 0;
+ }
+ 
++#if defined(__SND_STRUCT_TIME64) && __SIZEOF_LONG__ == 4
++/* Pre-time64 kernel UAPI layout: all frame counts and timestamps are 32-bit. */
++struct snd_pcm_status_legacy {
++    __s32 state;
++    struct __snd_timespec trigger_tstamp;
++    struct __snd_timespec tstamp;
++    __u32 appl_ptr, hw_ptr;
++    __s32 delay;
++    __u32 avail, avail_max, overrange;
++    __s32 suspended_state;
++    __u32 audio_tstamp_data;
++    struct __snd_timespec audio_tstamp;
++    struct __snd_timespec driver_tstamp;
++    __u32 audio_tstamp_accuracy;
++    unsigned char reserved[36];
++};
++_Static_assert(sizeof(struct snd_pcm_status_legacy) == 108, "legacy PCM status ABI");
++#endif
++
++static int snd_pcm_hw_status_ioctl(snd_pcm_hw_t *hw, unsigned int cmd,
++                                   snd_pcm_status_t *status)
++{
++#if defined(__SND_STRUCT_TIME64) && __SIZEOF_LONG__ == 4
++    struct snd_pcm_status_legacy legacy;
++    unsigned int bit = cmd == SNDRV_PCM_IOCTL_STATUS_EXT ? 2 : 1;
++    unsigned int legacy_cmd;
++    int ret;
++
++    if (!(hw->status_legacy_mask & bit)) {
++        ret = ioctl(hw->fd, cmd, status);
++        if (ret >= 0 || errno != ENOTTY)
++            return ret;
++    }
++    memset(&legacy, 0, sizeof(legacy));
++    /* STATUS_EXT accepts the requested audio timestamp type as input. */
++    if (cmd == SNDRV_PCM_IOCTL_STATUS_EXT)
++        legacy.audio_tstamp_data = status->audio_tstamp_data;
++    legacy_cmd = cmd == SNDRV_PCM_IOCTL_STATUS_EXT ?
++        _IOWR('A', 0x24, struct snd_pcm_status_legacy) :
++        _IOR('A', 0x20, struct snd_pcm_status_legacy);
++    ret = ioctl(hw->fd, legacy_cmd, &legacy);
++    if (ret < 0)
++        return ret;
++
++    memset(status, 0, sizeof(*status));
++    status->state = legacy.state;
++    status->trigger_tstamp.tv_sec = legacy.trigger_tstamp.tv_sec;
++    status->trigger_tstamp.tv_nsec = legacy.trigger_tstamp.tv_nsec;
++    status->tstamp.tv_sec = legacy.tstamp.tv_sec;
++    status->tstamp.tv_nsec = legacy.tstamp.tv_nsec;
++    status->appl_ptr = legacy.appl_ptr;
++    status->hw_ptr = legacy.hw_ptr;
++    status->delay = legacy.delay;
++    status->avail = legacy.avail;
++    status->avail_max = legacy.avail_max;
++    status->overrange = legacy.overrange;
++    status->suspended_state = legacy.suspended_state;
++    status->audio_tstamp_data = legacy.audio_tstamp_data;
++    status->audio_tstamp.tv_sec = legacy.audio_tstamp.tv_sec;
++    status->audio_tstamp.tv_nsec = legacy.audio_tstamp.tv_nsec;
++    status->driver_tstamp.tv_sec = legacy.driver_tstamp.tv_sec;
++    status->driver_tstamp.tv_nsec = legacy.driver_tstamp.tv_nsec;
++    status->audio_tstamp_accuracy = legacy.audio_tstamp_accuracy;
++    hw->status_legacy_mask |= bit;
++    return ret;
++#else
++    return ioctl(hw->fd, cmd, status);
++#endif
++}
++
+ static int snd_pcm_hw_status(snd_pcm_t *pcm, snd_pcm_status_t * status)
+ {
+ 	snd_pcm_hw_t *hw = pcm->private_data;
+-	int fd = hw->fd, err;
++	int err;
+ 	if (SNDRV_PROTOCOL_VERSION(2, 0, 13) > hw->version) {
+-		if (ioctl(fd, SNDRV_PCM_IOCTL_STATUS, status) < 0) {
++		if (snd_pcm_hw_status_ioctl(hw, SNDRV_PCM_IOCTL_STATUS, status) < 0) {
+ 			err = -errno;
+ 			SYSMSG("SNDRV_PCM_IOCTL_STATUS failed (%i)", err);
+ 			return err;
+ 		}
+ 	} else {
+-		if (ioctl(fd, SNDRV_PCM_IOCTL_STATUS_EXT, status) < 0) {
++		if (snd_pcm_hw_status_ioctl(hw, SNDRV_PCM_IOCTL_STATUS_EXT, status) < 0) {
+ 			err = -errno;
+ 			SYSMSG("SNDRV_PCM_IOCTL_STATUS_EXT failed (%i)", err);
+ 			return err;

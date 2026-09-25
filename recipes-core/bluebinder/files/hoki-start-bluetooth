@@ -1,0 +1,23 @@
+#!/bin/sh
+# The Hoki HAL is a one-shot Android init service. A bluebinder restart must
+# start it again after exit; waiting for it cannot recover a stopped service.
+# This starts the transport, not the radio: bluebinder/ConnMan retain rfkill.
+set -eu
+attempt=0
+started=0
+while [ "$attempt" -lt 10 ]; do
+    state=$(getprop init.svc.vendor.bluetooth-1-0)
+    case "$state" in
+        running) exit 0 ;;
+        stopped)
+            if [ "$started" -eq 0 ]; then
+                setprop ctl.start vendor.bluetooth-1-0
+                started=1
+            fi
+            ;;
+    esac
+    attempt=$((attempt + 1))
+    sleep 1
+done
+echo 'Android Bluetooth HAL did not start within 10 seconds' >&2
+exit 1

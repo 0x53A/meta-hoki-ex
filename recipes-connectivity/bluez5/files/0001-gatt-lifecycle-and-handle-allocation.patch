@@ -1,0 +1,1124 @@
+From: Hoki local integration <code@lukasrieger.com>
+Subject: [PATCH] gatt: preserve peer ownership and validate attribute allocation
+
+Keep bonded subscriptions separate from acquired socket lifetimes. Scope
+asynchronous operations to their ATT peer, retain buffers, and cancel callbacks
+when their application disappears. Preserve write request completion semantics.
+Allocate external descriptors relative to their characteristic and reject
+intersecting service ranges.
+
+Upstream-Status: Pending [local regression testing; not submitted]
+
+--- a/src/gatt-database.c
++++ b/src/gatt-database.c
+@@ -130,6 +130,8 @@
+ 	uint16_t mtu;
+ 	struct queue *write_ios;
+ 	struct queue *notify_ios;
++	struct queue *pending_notifies;
++	struct queue *pending_acquires;
+ 	struct gatt_db_attribute *attrib;
+ 	struct gatt_db_attribute *ccc;
+ 	struct queue *pending_reads;
+@@ -163,6 +165,11 @@
+ 	struct iovec data;
+ 	bool is_characteristic;
+ 	bool prep_authorize;
++	bool ccc_enabled;
++	bool owns_value;
++	bool acquire_leader;
++	bool acquisition;
++	const char *write_type;
+ };
+ 
+ struct notify {
+@@ -178,6 +185,7 @@
+ 
+ struct device_state {
+ 	struct btd_gatt_database *db;
++	struct bt_att *att;
+ 	bdaddr_t bdaddr;
+ 	uint8_t bdaddr_type;
+ 	unsigned int disc_id;
+@@ -209,6 +217,9 @@
+ 	uint8_t bdaddr_type;
+ };
+ 
++static bool ccc_needs_notify_io(struct ccc_cb_data *ccc_cb,
++					struct bt_att *att);
++
+ static void ccc_cb_free(void *data)
+ {
+ 	struct ccc_cb_data *ccc_cb = data;
+@@ -297,6 +308,8 @@
+ 	struct device_state *state = data;
+ 
+ 	queue_destroy(state->ccc_states, free);
++	bt_att_unregister_disconnect(state->att, state->disc_id);
++	bt_att_unref(state->att);
+ 
+ 	if (state->pending) {
+ 		free(state->pending->value);
+@@ -309,8 +322,10 @@
+ static void clear_ccc_state(void *data, void *user_data)
+ {
+ 	struct ccc_state *ccc = data;
+-	struct btd_gatt_database *db = user_data;
++	struct device_state *state = user_data;
++	struct btd_gatt_database *db = state->db;
+ 	struct ccc_cb_data *ccc_cb;
++	struct pending_op *op;
+ 
+ 	if (!ccc->value)
+ 		return;
+@@ -320,8 +335,14 @@
+ 	if (!ccc_cb)
+ 		return;
+ 
+-	if (ccc_cb->callback)
+-		ccc_cb->callback(NULL, ccc_cb->user_data);
++	if (!ccc_cb->callback)
++		return;
++
++	/* Preserve peer identity: NULL used to remove another client's socket. */
++	op = new0(struct pending_op, 1);
++	op->att = bt_att_ref(state->att);
++	op->ccc_enabled = true;
++	ccc_cb->callback(op, ccc_cb->user_data);
+ }
+ 
+ static void att_disconnected(int err, void *user_data)
+@@ -356,7 +377,7 @@
+ remove:
+ 	/* Remove device state if device no longer exists or is not paired */
+ 	if (queue_remove(state->db->device_states, state)) {
+-		queue_foreach(state->ccc_states, clear_ccc_state, state->db);
++		queue_foreach(state->ccc_states, clear_ccc_state, state);
+ 		device_state_free(state);
+ 	}
+ }
+@@ -424,6 +445,12 @@
+ 	queue_push_tail(database->device_states, dev_state);
+ 
+ done:
++	if (dev_state->att != att) {
++		bt_att_unregister_disconnect(dev_state->att, dev_state->disc_id);
++		dev_state->disc_id = 0;
++		bt_att_unref(dev_state->att);
++		dev_state->att = bt_att_ref(att);
++	}
+ 	if (!dev_state->disc_id)
+ 		dev_state->disc_id = bt_att_register_disconnect(att,
+ 							att_disconnected,
+@@ -453,6 +480,8 @@
+ 	return ccc;
+ }
+ 
++static void pending_op_free(void *data);
++
+ static void cancel_pending_read(void *data)
+ {
+ 	struct pending_op *op = data;
+@@ -472,6 +501,22 @@
+ 	op->owner_queue = NULL;
+ }
+ 
++static void cancel_pending_notify(void *data)
++{
++	struct pending_op *op = data;
++
++	op->owner_queue = NULL;
++}
++
++static void cancel_pending_acquire(void *data)
++{
++	struct pending_op *op = data;
++
++	op->owner_queue = NULL;
++	if (!op->acquire_leader)
++		pending_op_free(op);
++}
++
+ static void client_io_free(void *data)
+ {
+ 	struct client_io *client = data;
+@@ -488,6 +533,8 @@
+ 
+ 	queue_destroy(chrc->write_ios, client_io_free);
+ 	queue_destroy(chrc->notify_ios, client_io_free);
++	queue_destroy(chrc->pending_notifies, cancel_pending_notify);
++	queue_destroy(chrc->pending_acquires, cancel_pending_acquire);
+ 
+ 	queue_destroy(chrc->pending_reads, cancel_pending_read);
+ 	queue_destroy(chrc->pending_writes, cancel_pending_write);
+@@ -994,6 +1041,8 @@
+ 
+ 	bt_att_unregister_disconnect(op->att, op->disconn_id);
+ 	bt_att_unref(op->att);
++	if (op->owns_value)
++		free(op->data.iov_base);
+ 	free(op);
+ }
+ 
+@@ -1001,7 +1050,11 @@
+ {
+ 	struct pending_op *op = user_data;
+ 
++	if (op->owner_queue)
++		queue_remove(op->owner_queue, op);
+ 	op->owner_queue = NULL;
++	if (op->acquisition && !op->acquire_leader)
++		pending_op_free(op);
+ }
+ 
+ static struct pending_op *pending_ccc_new(struct bt_att *att,
+@@ -1072,12 +1125,13 @@
+ 	else
+ 		val = get_le16(value);
+ 
+-	/* If value is identical, then just succeed */
+-	if (val == ccc->value)
+-		goto done;
+-
+ 	ccc_cb = queue_find(database->ccc_callbacks, ccc_cb_match_handle,
+ 			UINT_TO_PTR(gatt_db_attribute_get_handle(attrib)));
++
++	/* Bonded CCC values survive disconnect, acquired sockets do not. */
++	if (val == ccc->value &&
++			(!val || !ccc_needs_notify_io(ccc_cb, att)))
++		goto done;
+ 	if (ccc_cb) {
+ 		struct pending_op *op;
+ 
+@@ -1088,6 +1142,7 @@
+ 			goto done;
+ 		}
+ 
++		op->ccc_enabled = ccc->value != 0;
+ 		ecode = ccc_cb->callback(op, ccc_cb->user_data);
+ 		if (ecode)
+ 			pending_op_free(op);
+@@ -1468,7 +1523,7 @@
+ 	/* Remove device state if device no longer exists or is not paired */
+ 	if (queue_remove(notify->database->device_states, device_state)) {
+ 		queue_foreach(device_state->ccc_states, clear_ccc_state,
+-						notify->database);
++						device_state);
+ 		device_state_free(device_state);
+ 	}
+ }
+@@ -1913,6 +1968,8 @@
+ 	chrc = new0(struct external_chrc, 1);
+ 	chrc->pending_reads = queue_new();
+ 	chrc->pending_writes = queue_new();
++	chrc->pending_notifies = queue_new();
++	chrc->pending_acquires = queue_new();
+ 
+ 	chrc->path = g_strdup(path);
+ 	if (!chrc->path)
+@@ -2446,13 +2503,12 @@
+ 					&dict);
+ 
+ 	append_options(&dict, op);
++	if (op->write_type)
++		dict_append_entry(&dict, "type", DBUS_TYPE_STRING,
++						&op->write_type);
+ 
+ 	dbus_message_iter_close_container(iter, &dict);
+ 
+-	if (!op->owner_queue) {
+-		gatt_db_attribute_write_result(op->attrib, op->id, 0);
+-		pending_op_free(op);
+-	}
+ }
+ 
+ static void write_reply_cb(DBusMessage *message, void *user_data)
+@@ -2508,7 +2564,7 @@
+ 					struct gatt_db_attribute *attrib,
+ 					unsigned int id,
+ 					const uint8_t *value, size_t len,
+-					uint16_t offset,
++					uint16_t offset, uint8_t opcode,
+ 					bool is_characteristic,
+ 					bool prep_authorize)
+ {
+@@ -2527,6 +2583,19 @@
+ 	op->link_type = bt_att_get_link_type(att);
+ 	op->is_characteristic = is_characteristic;
+ 	op->prep_authorize = prep_authorize;
++	switch (opcode) {
++	case BT_ATT_OP_WRITE_CMD:
++	case BT_ATT_OP_SIGNED_WRITE_CMD:
++		op->write_type = "command";
++		break;
++	case BT_ATT_OP_PREP_WRITE_REQ:
++	case BT_ATT_OP_EXEC_WRITE_REQ:
++		op->write_type = "reliable";
++		break;
++	default:
++		op->write_type = "request";
++		break;
++	}
+ 	queue_push_tail(owner_queue, op);
+ 
+ 	op->disconn_id = bt_att_register_disconnect(att,
+@@ -2536,30 +2605,35 @@
+ 	return op;
+ }
+ 
+-static struct pending_op *send_write(struct bt_att *att,
++static bool send_write(struct bt_att *att,
+ 					struct gatt_db_attribute *attrib,
+ 					GDBusProxy *proxy,
+ 					struct queue *owner_queue,
+ 					unsigned int id,
+ 					const uint8_t *value, size_t len,
+-					uint16_t offset,
++					uint16_t offset, uint8_t opcode,
+ 					bool is_characteristic,
+ 					bool prep_authorize)
+ {
+ 	struct pending_op *op;
+ 
+ 	op = pending_write_new(att, owner_queue, attrib, id, value, len,
+-					offset, is_characteristic,
++					offset, opcode, is_characteristic,
+ 					prep_authorize);
+ 
+ 	if (g_dbus_proxy_method_call(proxy, "WriteValue", write_setup_cb,
+ 					owner_queue ? write_reply_cb : NULL,
+-					op, pending_op_free) == TRUE)
+-		return op;
++					op, pending_op_free) == TRUE) {
++		if (!owner_queue) {
++			gatt_db_attribute_write_result(attrib, id, 0);
++			pending_op_free(op);
++		}
++		return true;
++	}
+ 
+ 	pending_op_free(op);
+ 
+-	return NULL;
++	return false;
+ }
+ 
+ static void flush_pending_write(void *data, void *user_data)
+@@ -2573,13 +2647,6 @@
+ 		return;
+ 
+ 	pending_op_free(op);
+-}
+-
+-static void flush_pending_writes(GDBusProxy *proxy,
+-					struct queue *owner_queue)
+-{
+-	queue_foreach(owner_queue, flush_pending_write, proxy);
+-	queue_remove_all(owner_queue, NULL, NULL, NULL);
+ }
+ 
+ static bool match_client_io(const void *data, const void *user_data)
+@@ -2731,13 +2798,8 @@
+ 	const struct client_io *client = data;
+ 	const struct bt_att *att = user_data;
+ 
+-	/* Always match if ATT instance is not set since that is used by
+-	 * clear_cc_state to clear all instances.
+-	 */
+-	if (!att)
+-		return true;
+-
+-	return client->att == att;
++	/* A missing identity must never select another peer's socket. */
++	return att && client->att == att;
+ }
+ 
+ static struct client_io *
+@@ -2757,6 +2819,13 @@
+ 	queue_push_tail(chrc->write_ios, client);
+ 
+ 	return client;
++}
++
++static bool match_pending_att(const void *data, const void *user_data)
++{
++	const struct pending_op *op = data;
++
++	return op->att == user_data;
+ }
+ 
+ static void acquire_write_reply(DBusMessage *message, void *user_data)
+@@ -2770,6 +2839,7 @@
+ 
+ 	if (!op->owner_queue) {
+ 		DBG("Pending write was canceled when object got removed");
++		pending_op_free(op);
+ 		return;
+ 	}
+ 
+@@ -2786,9 +2856,15 @@
+ 		dbus_error_free(&err);
+ 
+ 		if (ecode != BT_ATT_ERROR_UNLIKELY) {
+-			gatt_db_attribute_write_result(op->attrib, op->id,
++			struct bt_att *att = bt_att_ref(op->att);
++
++			while ((op = queue_find(chrc->pending_acquires,
++						match_pending_att, att))) {
++				gatt_db_attribute_write_result(op->attrib, op->id,
+ 								ecode);
+-			pending_op_free(op);
++				pending_op_free(op);
++			}
++			bt_att_unref(att);
+ 			return;
+ 		}
+ 
+@@ -2808,7 +2884,8 @@
+ 	if (!client)
+ 		goto retry;
+ 
+-	while ((op = queue_peek_head(chrc->pending_writes)) != NULL) {
++	while ((op = queue_find(chrc->pending_acquires,
++				match_pending_att, client->att)) != NULL) {
+ 		if (sock_io_send(client->io, op->data.iov_base,
+ 					op->data.iov_len) < 0)
+ 			goto retry;
+@@ -2820,7 +2897,21 @@
+ 	return;
+ 
+ retry:
+-	flush_pending_writes(chrc->proxy, chrc->pending_writes);
++	{
++		struct bt_att *att = bt_att_ref(op->att);
++		struct pending_op *pending;
++
++		while ((pending = queue_remove_if(chrc->pending_acquires,
++						match_pending_att, att))) {
++			pending->acquire_leader = false;
++			pending->acquisition = false;
++			pending->owns_value = true;
++			pending->owner_queue = chrc->pending_writes;
++			queue_push_tail(pending->owner_queue, pending);
++			flush_pending_write(pending, chrc->proxy);
++		}
++		bt_att_unref(att);
++	}
+ }
+ 
+ static void acquire_write_setup(DBusMessageIter *iter, void *user_data)
+@@ -2844,17 +2935,24 @@
+ 					struct bt_att *att,
+ 					struct gatt_db_attribute *attrib,
+ 					unsigned int id,
+-					const uint8_t *value, size_t len)
++					const uint8_t *value, size_t len,
++					uint8_t opcode)
+ {
+ 	struct pending_op *op;
+-	bool acquiring = !queue_isempty(chrc->pending_writes);
+-
+-	op = pending_write_new(att, chrc->pending_writes, attrib, id, value,
+-				len, 0, false, false);
+-
++	bool acquiring = queue_find(chrc->pending_acquires,
++					match_pending_att, att) != NULL;
++
++	op = pending_write_new(att, chrc->pending_acquires, attrib, id, value,
++				len, 0, opcode, false, false);
++
++	/* Input ATT buffers are borrowed and cannot survive the async reply. */
++	op->acquisition = true;
++	op->data.iov_base = util_memdup(value, len);
++	op->owns_value = true;
+ 	if (acquiring)
+ 		return op;
+ 
++	op->acquire_leader = true;
+ 	if (g_dbus_proxy_method_call(chrc->proxy, "AcquireWrite",
+ 					acquire_write_setup,
+ 					acquire_write_reply,
+@@ -2929,7 +3027,6 @@
+ 	if (!client)
+ 		goto retry;
+ 
+-	__sync_fetch_and_add(&chrc->ntfy_cnt, 1);
+ 
+ 	return;
+ 
+@@ -2937,7 +3034,6 @@
+ 	g_dbus_proxy_method_call(chrc->proxy, "StartNotify", NULL, NULL,
+ 							NULL, NULL);
+ 
+-	__sync_fetch_and_add(&chrc->ntfy_cnt, 1);
+ }
+ 
+ static void acquire_notify_setup(DBusMessageIter *iter, void *user_data)
+@@ -2970,6 +3066,11 @@
+ 
+ 	/* Notifications/indications disabled */
+ 	if (!value) {
++		/* Ignore late AcquireNotify replies after unsubscribe. */
++		if (op)
++			queue_remove_all(chrc->pending_notifies,
++					match_pending_att, op->att,
++					cancel_pending_notify);
+ 		if (!chrc->ntfy_cnt)
+ 			goto done;
+ 
+@@ -3004,21 +3105,24 @@
+ 		return BT_ERROR_CCC_IMPROPERLY_CONFIGURED;
+ 
+ 	client = queue_find(chrc->notify_ios, match_client_att, op->att);
+-	if (client) {
+-		__sync_fetch_and_add(&chrc->ntfy_cnt, 1);
++	if (client || queue_find(chrc->pending_notifies,
++					match_pending_att, op->att))
+ 		goto done;
+-	}
+ 
+ 	/* Make use of AcquireNotify if supported */
+ 	if (g_dbus_proxy_get_property(chrc->proxy, "NotifyAcquired", &iter)) {
+ 		op->data.iov_base = (void *) chrc;
+ 		op->data.iov_len = sizeof(chrc);
+-		op->owner_queue = chrc->pending_writes;
++		op->owner_queue = chrc->pending_notifies;
++		queue_push_tail(op->owner_queue, op);
+ 		if (g_dbus_proxy_method_call(chrc->proxy, "AcquireNotify",
+ 						acquire_notify_setup,
+ 						acquire_notify_reply,
+-						op, pending_op_free))
++						op, pending_op_free)) {
++			if (!op->ccc_enabled)
++				__sync_fetch_and_add(&chrc->ntfy_cnt, 1);
+ 			return 0;
++		}
+ 	}
+ 
+ 	/*
+@@ -3029,13 +3133,30 @@
+ 						NULL, NULL) == FALSE)
+ 		return BT_ATT_ERROR_UNLIKELY;
+ 
+-	__sync_fetch_and_add(&chrc->ntfy_cnt, 1);
++	if (!op->ccc_enabled)
++		__sync_fetch_and_add(&chrc->ntfy_cnt, 1);
+ 
+ done:
+ 	if (op)
+ 		pending_op_free(op);
+ 
+ 	return 0;
++}
++
++/* Only acquired per-ATT sockets need rearming; ordinary CCC callbacks
++ * retain their existing idempotent-write behavior. */
++static bool ccc_needs_notify_io(struct ccc_cb_data *ccc_cb, struct bt_att *att)
++{
++	struct external_chrc *chrc;
++	DBusMessageIter iter;
++
++	if (!ccc_cb || ccc_cb->callback != ccc_write_cb)
++		return false;
++
++	chrc = ccc_cb->user_data;
++	return g_dbus_proxy_get_property(chrc->proxy, "NotifyAcquired", &iter) &&
++		!queue_find(chrc->notify_ios, match_client_att, att) &&
++		!queue_find(chrc->pending_notifies, match_pending_att, att);
+ }
+ 
+ static void property_changed_cb(GDBusProxy *proxy, const char *name,
+@@ -3086,12 +3207,14 @@
+ 	/* Always set read/write permissions */
+ 	chrc->ccc_perm |= BT_ATT_PERM_WRITE | BT_ATT_PERM_READ;
+ 
+-	chrc->ccc = service_add_ccc(service->attrib, service->app->database,
+-				    ccc_write_cb, chrc, chrc->ccc_perm, NULL);
++	chrc->ccc = gatt_db_characteristic_add_ccc(chrc->attrib,
++						chrc->ccc_perm);
+ 	if (!chrc->ccc) {
+ 		error("Failed to create CCC entry for characteristic");
+ 		return false;
+ 	}
++
++	ccc_add_cb(service->app->database, chrc->ccc, ccc_write_cb, chrc, NULL);
+ 
+ 	if (g_dbus_proxy_set_property_watch(chrc->proxy, property_changed_cb,
+ 							chrc) == FALSE) {
+@@ -3124,7 +3247,7 @@
+ 		return true;
+ 
+ 	bt_uuid16_create(&uuid, GATT_CHARAC_EXT_PROPER_UUID);
+-	cep = gatt_db_service_add_descriptor(service->attrib, &uuid,
++	cep = gatt_db_characteristic_insert_descriptor(chrc->attrib, 0, &uuid,
+ 							BT_ATT_PERM_READ,
+ 							NULL, NULL, NULL);
+ 	if (!cep) {
+@@ -3199,7 +3322,7 @@
+ 						desc->req_prep_authorization)
+ 			send_write(att, attrib, desc->proxy,
+ 					desc->pending_writes, id, value, len,
+-					offset, false, true);
++					offset, opcode, false, true);
+ 		else
+ 			gatt_db_attribute_write_result(attrib, id, 0);
+ 
+@@ -3210,7 +3333,7 @@
+ 		desc->prep_authorized = false;
+ 
+ 	if (send_write(att, attrib, desc->proxy, desc->pending_writes, id,
+-			value, len, offset, false, false))
++			value, len, offset, opcode, false, false))
+ 		return;
+ 
+ fail:
+@@ -3230,7 +3353,8 @@
+ }
+ 
+ static bool database_add_desc(struct external_service *service,
+-						struct external_desc *desc)
++						struct external_desc *desc,
++						struct external_chrc *chrc)
+ {
+ 	uint16_t handle;
+ 	bt_uuid_t uuid;
+@@ -3246,7 +3370,7 @@
+ 		return false;
+ 	}
+ 
+-	desc->attrib = gatt_db_service_insert_descriptor(service->attrib,
++	desc->attrib = gatt_db_characteristic_insert_descriptor(chrc->attrib,
+ 							handle, &uuid,
+ 							desc->perm,
+ 							desc_read_cb,
+@@ -3321,7 +3445,8 @@
+ 		goto fail;
+ 	}
+ 
+-	if (!(chrc->props & BT_GATT_CHRC_PROP_WRITE_WITHOUT_RESP))
++	if (opcode != BT_ATT_OP_WRITE_CMD &&
++					opcode != BT_ATT_OP_SIGNED_WRITE_CMD)
+ 		queue = chrc->pending_writes;
+ 	else
+ 		queue = NULL;
+@@ -3330,7 +3455,7 @@
+ 		if (!btd_device_is_trusted(device) && !chrc->prep_authorized &&
+ 						chrc->req_prep_authorization)
+ 			send_write(att, attrib, chrc->proxy, queue,
+-					id, value, len, offset,
++					id, value, len, offset, opcode,
+ 					true, true);
+ 		else
+ 			gatt_db_attribute_write_result(attrib, id, 0);
+@@ -3342,7 +3467,7 @@
+ 		chrc->prep_authorized = false;
+ 
+ 	client = queue_find(chrc->write_ios, match_client_att, att);
+-	if (client) {
++	if (!queue && client) {
+ 		if (sock_io_send(client->io, value, len) < 0) {
+ 			error("Unable to write: %s", strerror(errno));
+ 			goto fail;
+@@ -3352,13 +3477,13 @@
+ 		return;
+ 	}
+ 
+-	if (g_dbus_proxy_get_property(chrc->proxy, "WriteAcquired", &iter)) {
+-		if (acquire_write(chrc, att, attrib, id, value, len))
++	if (!queue && g_dbus_proxy_get_property(chrc->proxy, "WriteAcquired", &iter)) {
++		if (acquire_write(chrc, att, attrib, id, value, len, opcode))
+ 			return;
+ 	}
+ 
+ 	if (send_write(att, attrib, chrc->proxy, queue, id, value, len,
+-			offset, false, false))
++			offset, opcode, false, false))
+ 		return;
+ 
+ fail:
+@@ -3402,7 +3527,6 @@
+ 	uint16_t handle = 0, value_handle;
+ 	bt_uuid_t uuid;
+ 	char str[MAX_LEN_UUID_STR];
+-	const struct queue_entry *entry;
+ 
+ 	if (!parse_handle(chrc->proxy, &value_handle)) {
+ 		error("Failed to read \"Handle\" property of characteristic");
+@@ -3432,12 +3556,6 @@
+ 		return false;
+ 	}
+ 
+-	if (!database_add_ccc(service, chrc))
+-		return false;
+-
+-	if (!database_add_cep(service, chrc))
+-		return false;
+-
+ 	if (!handle) {
+ 		handle = gatt_db_attribute_get_handle(chrc->attrib);
+ 		write_handle(chrc->proxy, handle);
+@@ -3446,6 +3564,17 @@
+ 	bt_uuid_to_string(&uuid, str, sizeof(str));
+ 
+ 	DBG("handle 0x%04x UUID %s", handle, str);
++
++	return true;
++}
++
++static bool database_add_chrc_descriptors(struct external_service *service,
++						struct external_chrc *chrc)
++{
++	const struct queue_entry *entry;
++
++	if (!database_add_ccc(service, chrc) || !database_add_cep(service, chrc))
++		return false;
+ 
+ 	/* Handle the descriptors that belong to this characteristic. */
+ 	for (entry = queue_get_entries(service->descs); entry;
+@@ -3455,7 +3584,7 @@
+ 		if (desc->handled || g_strcmp0(desc->chrc_path, chrc->path))
+ 			continue;
+ 
+-		if (!database_add_desc(service, desc)) {
++		if (!database_add_desc(service, desc, chrc)) {
+ 			chrc->attrib = NULL;
+ 			error("Failed to create descriptor entry");
+ 			return false;
+@@ -3470,6 +3599,20 @@
+ 	const struct external_desc *desc = a;
+ 
+ 	return !desc->handled;
++}
++
++static gint compare_chrc_handles(gconstpointer a, gconstpointer b)
++{
++	const struct external_chrc *left = a, *right = b;
++	uint16_t lh = 0, rh = 0;
++
++	parse_handle(left->proxy, &lh);
++	parse_handle(right->proxy, &rh);
++	if (!lh)
++		return rh ? 1 : 0;
++	if (!rh)
++		return -1;
++	return (lh > rh) - (lh < rh);
+ }
+ 
+ static bool database_add_service(struct external_service *service)
+@@ -3479,6 +3622,7 @@
+ 	uint16_t handle;
+ 	const struct queue_entry *entry;
+ 	char str[MAX_LEN_UUID_STR];
++	GList *ordered = NULL, *item;
+ 
+ 	if (!parse_uuid(service->proxy, &uuid)) {
+ 		error("Failed to read \"UUID\" property of service");
+@@ -3499,6 +3643,12 @@
+ 		error("Failed to read \"Handle\" property of service");
+ 		return false;
+ 	}
++
++	/* The shared database permits exact-match reuse for discovery. External
++	 * publishers need exclusive ownership: cleanup must never remove another
++	 * application's existing service when a duplicate registration fails. */
++	if (handle && gatt_db_get_service(service->app->database->db, handle))
++		return false;
+ 
+ 	service->attrib = gatt_db_insert_service(service->app->database->db,
+ 						handle, &uuid,
+@@ -3517,16 +3667,39 @@
+ 
+ 	database_add_includes(service);
+ 
+-	entry = queue_get_entries(service->chrcs);
+-	while (entry) {
++	/* ObjectManager dictionaries have no ordering guarantee. Register
++	 * explicit handles in ascending order so generated descriptors belong
++	 * to the characteristic being added, independently of reply order. */
++	for (entry = queue_get_entries(service->chrcs); entry; entry = entry->next) {
+ 		struct external_chrc *chrc = entry->data;
+-
+-		if (!database_add_chrc(service, chrc)) {
+-			error("Failed to add characteristic");
++		uint16_t value_handle;
++
++		if (!parse_handle(chrc->proxy, &value_handle))
+ 			goto fail;
+-		}
+-
+-		entry = entry->next;
++		ordered = g_list_prepend(ordered, chrc);
++	}
++	ordered = g_list_sort(g_list_reverse(ordered), compare_chrc_handles);
++
++	/* Install every explicit declaration before its descriptors so the
++	 * following characteristic bounds descriptor allocation. */
++	for (item = ordered; item; item = item->next) {
++		struct external_chrc *chrc = item->data;
++		uint16_t value_handle;
++
++		parse_handle(chrc->proxy, &value_handle);
++		if (value_handle && !database_add_chrc(service, chrc))
++			goto fail;
++	}
++
++	/* Explicit characteristics sort first. Automatic ones retain sequential
++	 * allocation, including room for each characteristic's descriptors. */
++	for (item = ordered; item; item = item->next) {
++		struct external_chrc *chrc = item->data;
++
++		if (!chrc->attrib && !database_add_chrc(service, chrc))
++			goto fail;
++		if (!database_add_chrc_descriptors(service, chrc))
++			goto fail;
+ 	}
+ 
+ 	/* If there are any unhandled descriptors, return an error */
+@@ -3535,11 +3708,13 @@
+ 		goto fail;
+ 	}
+ 
++	g_list_free(ordered);
+ 	gatt_db_service_set_active(service->attrib, true);
+ 
+ 	return true;
+ 
+ fail:
++	g_list_free(ordered);
+ 	gatt_db_remove_service(service->app->database->db, service->attrib);
+ 	service->attrib = NULL;
+ 
+--- a/src/shared/gatt-db.c
++++ b/src/shared/gatt-db.c
+@@ -748,10 +748,8 @@
+ 
+ 		gatt_db_service_get_handles(service, &cur_start, &cur_end);
+ 
+-		if (start >= cur_start && start <= cur_end)
+-			return service;
+-
+-		if (end >= cur_start && end <= cur_end)
++		/* Inclusive intervals overlap unless one ends before the other. */
++		if (start <= cur_end && cur_start <= end)
+ 			return service;
+ 
+ 		if (end < cur_start)
+@@ -927,7 +925,7 @@
+ 			i++;
+ 	}
+ 
+-	if (i >= (service->num_handles - end_offset))
++	if (i >= (service->num_handles - end_offset) || service->attributes[i])
+ 		return 0;
+ 
+ 	/* Set handle based on the index */
+@@ -970,8 +968,27 @@
+ 					value_handle <= handle))
+ 		return NULL;
+ 
++	/* Automatic declarations need a consecutive free value slot. Do not
++	 * place the value into an earlier hole or across another declaration. */
++	if (!handle && !value_handle) {
++		for (i = 1; i + 1 < service->num_handles; i++) {
++			if (!service->attributes[i] && !service->attributes[i + 1]) {
++				handle = service->attributes[0]->handle + i;
++				break;
++			}
++		}
++		if (i + 1 >= service->num_handles)
++			return NULL;
++	}
++
+ 	i = service_get_attribute_index(service, &handle, 1);
+ 	if (!i)
++		return NULL;
++
++	if (!value_handle)
++		value_handle = handle + 1;
++	if (value_handle <= handle ||
++			!service_get_attribute_index(service, &value_handle, 0))
+ 		return NULL;
+ 
+ 	value[0] = properties;
+@@ -1166,52 +1183,111 @@
+ 					user_data);
+ }
+ 
+-static void find_ccc_value(struct gatt_db_attribute *attrib, void *user_data)
+-{
+-	uint16_t *handle = user_data;
+-
+-	gatt_db_attribute_get_char_data(attrib, NULL, handle, NULL, NULL, NULL);
+-}
+-
++/* Descriptor allocation must be relative to its characteristic value,
++ * not the first hole in the service or the highest existing characteristic. */
+ struct gatt_db_attribute *
+-gatt_db_service_add_ccc(struct gatt_db_attribute *attrib, uint32_t permissions)
++gatt_db_characteristic_insert_descriptor(struct gatt_db_attribute *value,
++					uint16_t handle,
++					const bt_uuid_t *uuid,
++					uint32_t permissions,
++					gatt_db_read_t read_func,
++					gatt_db_write_t write_func,
++					void *user_data)
++{
++	struct gatt_db_service *service;
++	struct gatt_db_attribute *attr;
++	unsigned int i, first, end;
++	uint16_t value_handle;
++	bool found = false;
++
++	if (!value)
++		return NULL;
++
++	service = value->service;
++	/* Verify that the argument really is a characteristic value. */
++	for (i = 1; i < service->num_handles; i++) {
++		attr = service->attributes[i];
++		if (!attr || bt_uuid_cmp(&attr->uuid, &characteristic_uuid))
++			continue;
++		if (gatt_db_attribute_get_char_data(attr, NULL, &value_handle,
++						NULL, NULL, NULL) &&
++					value_handle == value->handle) {
++			found = true;
++			break;
++		}
++	}
++	if (!found)
++		return NULL;
++
++	first = value->handle - service->attributes[0]->handle + 1;
++	end = service->num_handles;
++	for (i = first; i < end; i++) {
++		attr = service->attributes[i];
++		if (attr && !bt_uuid_cmp(&attr->uuid, &characteristic_uuid)) {
++			end = i;
++			break;
++		}
++	}
++
++	if (handle) {
++		if (handle <= value->handle)
++			return NULL;
++		i = handle - service->attributes[0]->handle;
++		if (i >= end || service->attributes[i])
++			return NULL;
++	} else {
++		for (i = first; i < end && service->attributes[i]; i++);
++		if (i == end)
++			return NULL;
++		handle = service->attributes[0]->handle + i;
++	}
++
++	return service_insert_descriptor(service, handle, uuid, permissions,
++					read_func, write_func, user_data);
++}
++
++struct gatt_db_attribute *
++gatt_db_characteristic_add_ccc(struct gatt_db_attribute *value,
++						uint32_t permissions)
+ {
+ 	struct gatt_db *db;
+ 	struct gatt_db_attribute *ccc;
+-	struct gatt_db_attribute *value;
+-	uint16_t handle = 0;
+-
+-	if (!attrib || !permissions)
+-		return NULL;
+-
+-	db = attrib->service->db;
+-
++
++	if (!value || !permissions || value->notify_func)
++		return NULL;
++	db = value->service->db;
+ 	if (!db->ccc)
+ 		return NULL;
+ 
+-	/* Locate value handle */
+-	gatt_db_service_foreach_char(attrib, find_ccc_value, &handle);
+-
+-	if (!handle)
+-		return NULL;
+-
+-	value = gatt_db_get_attribute(db, handle);
+-	if (!value || value->notify_func)
+-		return NULL;
+-
+-	ccc = service_insert_descriptor(attrib->service, 0, &ccc_uuid,
+-					permissions,
+-					db->ccc->read_func,
+-					db->ccc->write_func,
+-					db->ccc->user_data);
++	ccc = gatt_db_characteristic_insert_descriptor(value, 0, &ccc_uuid,
++				permissions, db->ccc->read_func,
++				db->ccc->write_func, db->ccc->user_data);
+ 	if (!ccc)
+-		return ccc;
++		return NULL;
+ 
+ 	gatt_db_attribute_set_fixed_length(ccc, 2);
+ 	ccc->notify_func = db->ccc->notify_func;
+ 	value->notify_func = db->ccc->notify_func;
+-
+ 	return ccc;
++}
++
++static void find_ccc_value(struct gatt_db_attribute *attrib, void *user_data)
++{
++	uint16_t *handle = user_data;
++
++	gatt_db_attribute_get_char_data(attrib, NULL, handle, NULL, NULL, NULL);
++}
++
++struct gatt_db_attribute *
++gatt_db_service_add_ccc(struct gatt_db_attribute *attrib, uint32_t permissions)
++{
++	uint16_t handle = 0;
++
++	if (!attrib)
++		return NULL;
++	gatt_db_service_foreach_char(attrib, find_ccc_value, &handle);
++	return gatt_db_characteristic_add_ccc(
++			gatt_db_get_attribute(attrib->service->db, handle), permissions);
+ }
+ 
+ void gatt_db_ccc_register(struct gatt_db *db, gatt_db_read_t read_func,
+--- a/src/shared/gatt-db.h
++++ b/src/shared/gatt-db.h
+@@ -109,6 +109,19 @@
+ 					gatt_db_write_t write_func,
+ 					void *user_data);
+ 
++/* value is the characteristic value attribute, not the service. */
++struct gatt_db_attribute *
++gatt_db_characteristic_insert_descriptor(struct gatt_db_attribute *value,
++					uint16_t handle,
++					const bt_uuid_t *uuid,
++					uint32_t permissions,
++					gatt_db_read_t read_func,
++					gatt_db_write_t write_func,
++					void *user_data);
++struct gatt_db_attribute *
++gatt_db_characteristic_add_ccc(struct gatt_db_attribute *value,
++						uint32_t permissions);
++
+ struct gatt_db_attribute *
+ gatt_db_service_add_ccc(struct gatt_db_attribute *attrib, uint32_t permissions);
+ 
+--- a/unit/test-gatt.c
++++ b/unit/test-gatt.c
+@@ -2412,12 +2412,112 @@
+ 	context_quit(context);
+ }
+ 
++/* Database range validation: adjacent allocations are valid, intersections
++ * in either direction are rejected, and failed insertions preserve contents. */
++static void test_service_ranges(const void *user_data)
++{
++	struct gatt_db *db = gatt_db_new();
++	struct gatt_db_attribute *service;
++	bt_uuid_t uuid, other;
++
++	bt_uuid16_create(&uuid, 0x1800);
++	bt_uuid16_create(&other, 0x1801);
++	service = gatt_db_insert_service(db, 0x0100, &uuid, true, 8);
++	g_assert_nonnull(service);
++	g_assert_null(gatt_db_insert_service(db, 0x00ff, &other, true, 10));
++	g_assert_null(gatt_db_insert_service(db, 0x0101, &other, true, 2));
++	g_assert_null(gatt_db_insert_service(db, 0x00ff, &other, true, 2));
++	g_assert_null(gatt_db_insert_service(db, 0x0107, &other, true, 2));
++	g_assert_true(gatt_db_get_attribute(db, 0x0100) == service);
++	g_assert_nonnull(gatt_db_insert_service(db, 0x00f8, &other, true, 8));
++	g_assert_nonnull(gatt_db_insert_service(db, 0x0108, &other, true, 8));
++	gatt_db_unref(db);
++	tester_test_passed();
++}
++
++static void allocation_notify(struct gatt_db_attribute *attrib,
++					struct gatt_db_attribute *ccc,
++					const uint8_t *value, size_t len,
++					struct bt_att *att, void *user_data)
++{
++}
++
++static void test_characteristic_descriptor_allocation(const void *user_data)
++{
++	struct gatt_db *db = gatt_db_new();
++	struct gatt_db_attribute *service, *high, *low, *automatic, *ccc, *desc;
++	bt_uuid_t uuid, desc_uuid;
++
++	bt_uuid16_create(&uuid, 0x1800);
++	bt_uuid16_create(&desc_uuid, 0x2901);
++	gatt_db_ccc_register(db, NULL, NULL, allocation_notify, NULL);
++	service = gatt_db_insert_service(db, 0x0100, &uuid, true, 16);
++	g_assert_nonnull(service);
++	/* Reverse insertion with holes, then an automatic characteristic. */
++	high = gatt_db_service_insert_characteristic(service, 0x0108, 0x0109,
++			&uuid, BT_ATT_PERM_READ, BT_GATT_CHRC_PROP_NOTIFY,
++			NULL, NULL, NULL);
++	low = gatt_db_service_insert_characteristic(service, 0x0104, 0x0105,
++			&uuid, BT_ATT_PERM_READ, BT_GATT_CHRC_PROP_NOTIFY,
++			NULL, NULL, NULL);
++	automatic = gatt_db_service_add_characteristic(service, &uuid,
++			BT_ATT_PERM_READ, BT_GATT_CHRC_PROP_NOTIFY, NULL, NULL, NULL);
++	g_assert_nonnull(high);
++	g_assert_nonnull(low);
++	g_assert_nonnull(automatic);
++	g_assert_cmpuint(gatt_db_attribute_get_handle(automatic), ==, 0x0102);
++
++	ccc = gatt_db_characteristic_add_ccc(low, BT_ATT_PERM_READ);
++	g_assert_nonnull(ccc);
++	g_assert_cmpuint(gatt_db_attribute_get_handle(ccc), ==, 0x0106);
++	ccc = gatt_db_characteristic_add_ccc(high, BT_ATT_PERM_READ);
++	g_assert_nonnull(ccc);
++	g_assert_cmpuint(gatt_db_attribute_get_handle(ccc), ==, 0x010a);
++	ccc = gatt_db_characteristic_add_ccc(automatic, BT_ATT_PERM_READ);
++	g_assert_nonnull(ccc);
++	g_assert_cmpuint(gatt_db_attribute_get_handle(ccc), ==, 0x0103);
++	g_assert_null(gatt_db_characteristic_add_ccc(low, BT_ATT_PERM_READ));
++	g_assert_null(gatt_db_characteristic_add_ccc(service, BT_ATT_PERM_READ));
++
++	/* A descriptor may not precede its value, cross the next declaration,
++	 * overwrite an occupied slot, or wrap at the service end. */
++	g_assert_null(gatt_db_characteristic_insert_descriptor(low, 0x0103,
++			&desc_uuid, BT_ATT_PERM_READ, NULL, NULL, NULL));
++	g_assert_null(gatt_db_characteristic_insert_descriptor(low, 0x010b,
++			&desc_uuid, BT_ATT_PERM_READ, NULL, NULL, NULL));
++	g_assert_null(gatt_db_characteristic_insert_descriptor(low, 0x0106,
++			&desc_uuid, BT_ATT_PERM_READ, NULL, NULL, NULL));
++	desc = gatt_db_characteristic_insert_descriptor(low, 0, &desc_uuid,
++			BT_ATT_PERM_READ, NULL, NULL, NULL);
++	g_assert_nonnull(desc);
++	g_assert_cmpuint(gatt_db_attribute_get_handle(desc), ==, 0x0107);
++	g_assert_null(gatt_db_characteristic_insert_descriptor(low, 0, &desc_uuid,
++			BT_ATT_PERM_READ, NULL, NULL, NULL));
++	g_assert_null(gatt_db_service_insert_characteristic(service,
++			0x0106, 0x0107, &uuid, BT_ATT_PERM_READ,
++			BT_GATT_CHRC_PROP_READ, NULL, NULL, NULL));
++	g_assert_true(gatt_db_get_attribute(db, 0x0107) == desc);
++
++	service = gatt_db_insert_service(db, 0xfffd, &uuid, true, 3);
++	g_assert_nonnull(service);
++	high = gatt_db_service_add_characteristic(service, &uuid,
++			BT_ATT_PERM_READ, BT_GATT_CHRC_PROP_NOTIFY, NULL, NULL, NULL);
++	g_assert_nonnull(high);
++	g_assert_cmpuint(gatt_db_attribute_get_handle(high), ==, 0xffff);
++	g_assert_null(gatt_db_characteristic_add_ccc(high, BT_ATT_PERM_READ));
++	gatt_db_unref(db);
++	tester_test_passed();
++}
++
+ int main(int argc, char *argv[])
+ {
+ 	struct gatt_db *service_db_1, *service_db_2, *service_db_3;
+ 	struct gatt_db *ts_small_db, *ts_large_db_1, *ts_tail_db;
+ 
+ 	tester_init(&argc, &argv);
++	tester_add("/GATT/DB/service-ranges", NULL, NULL, test_service_ranges, NULL);
++	tester_add("/GATT/DB/characteristic-descriptors", NULL, NULL,
++			test_characteristic_descriptor_allocation, NULL);
+ 
+ 	service_db_1 = make_service_data_1_db();
+ 	service_db_2 = make_service_data_2_db();

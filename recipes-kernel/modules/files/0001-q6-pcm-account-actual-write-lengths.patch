@@ -1,0 +1,221 @@
+From: Hoki local development <code@lukasrieger.com>
+Subject: [PATCH] PCM: account for actual synchronous playback write lengths
+
+PulseAudio issues sub-period writes. Count the submitted length on DSP
+completion, preserve pre-RUN lengths, and retain ring-position overshoot.
+Snapshot completed length before recycling the DSP slot. Rebuild the entire
+audio module set because the shared internal structures change.
+
+Upstream-Status: Pending
+
+--- a/asoc/msm-pcm-q6-v2.c
++++ b/asoc/msm-pcm-q6-v2.c
+@@ -156,6 +156,13 @@
+ 	}
+ }
+ 
++static void msm_pcm_advance(struct msm_audio *prtd, unsigned int bytes)
++{
++	if (prtd->pcm_size)
++		WRITE_ONCE(prtd->pcm_irq_pos,
++			(READ_ONCE(prtd->pcm_irq_pos) + bytes) % prtd->pcm_size);
++}
++
+ static void event_handler(uint32_t opcode,
+ 		uint32_t token, uint32_t *payload, void *priv)
+ {
+@@ -167,12 +174,13 @@
+ 	uint8_t buf_index;
+ 	struct snd_soc_pcm_runtime *rtd;
+ 	int ret = 0;
++	unsigned long playback_flags;
+ 
+ 	switch (opcode) {
+ 	case ASM_DATA_EVENT_WRITE_DONE_V2: {
+ 		pr_debug("ASM_DATA_EVENT_WRITE_DONE_V2\n");
+ 		pr_debug("Buffer Consumed = 0x%08x\n", *ptrmem);
+-		prtd->pcm_irq_pos += prtd->pcm_count;
++		msm_pcm_advance(prtd, prtd->audio_client->write_done_size);
+ 		if (atomic_read(&prtd->start))
+ 			snd_pcm_period_elapsed(substream);
+ 		atomic_inc(&prtd->out_count);
+@@ -210,8 +218,8 @@
+ 		prtd->in_frame_info[buf_index].offset = payload[5];
+ 		/* assume data size = 0 during flushing */
+ 		if (prtd->in_frame_info[buf_index].size) {
+-			prtd->pcm_irq_pos +=
+-				prtd->in_frame_info[buf_index].size;
++			msm_pcm_advance(prtd,
++				prtd->in_frame_info[buf_index].size);
+ 			pr_debug("pcm_irq_pos=%d\n", prtd->pcm_irq_pos);
+ 			if (atomic_read(&prtd->start))
+ 				snd_pcm_period_elapsed(substream);
+@@ -228,7 +236,7 @@
+ 		} else {
+ 			pr_debug("%s: reclaim flushed buf in_count %x\n",
+ 				__func__, atomic_read(&prtd->in_count));
+-			prtd->pcm_irq_pos += prtd->pcm_count;
++			msm_pcm_advance(prtd, prtd->pcm_count);
+ 			if (prtd->mmap_flag) {
+ 				if (q6asm_is_cpu_buf_avail_nolock(OUT,
+ 				    prtd->audio_client,
+@@ -279,6 +287,7 @@
+ 				atomic_set(&prtd->start, 1);
+ 				break;
+ 			}
++			spin_lock_irqsave(&prtd->playback_lock, playback_flags);
+ 			if (prtd->mmap_flag) {
+ 				int cnt = prtd->pcm_size / prtd->pcm_count;
+ 
+@@ -295,17 +304,19 @@
+ 				}
+ 			} else {
+ 				while (atomic_read(&prtd->out_needed)) {
++					idx = prtd->audio_client->port[IN].dsp_buf;
+ 					pr_debug("%s:writing %d bytes of buffer to dsp\n",
+ 						__func__,
+ 						prtd->pcm_count);
+ 					q6asm_write_nolock(prtd->audio_client,
+-						prtd->pcm_count,
++						prtd->queued_size[idx],
+ 						0, 0, NO_TIMESTAMP);
+ 					atomic_dec(&prtd->out_needed);
+ 					wake_up(&the_locks.write_wait);
+ 				};
+ 			}
+ 			atomic_set(&prtd->start, 1);
++			spin_unlock_irqrestore(&prtd->playback_lock, playback_flags);
+ 			break;
+ 		case ASM_STREAM_CMD_REGISTER_PP_EVENTS:
+ 			pr_debug("%s: ASM_STREAM_CMD_REGISTER_PP_EVENTS:",
+@@ -320,7 +331,7 @@
+ 	break;
+ 	case RESET_EVENTS:
+ 		pr_debug("%s RESET_EVENTS\n", __func__);
+-		prtd->pcm_irq_pos += prtd->pcm_count;
++		msm_pcm_advance(prtd, prtd->pcm_count);
+ 		atomic_inc(&prtd->out_count);
+ 		atomic_inc(&prtd->in_count);
+ 		prtd->reset_event = true;
+@@ -739,6 +750,7 @@
+ 	if (prtd == NULL)
+ 		return -ENOMEM;
+ 
++	spin_lock_init(&prtd->playback_lock);
+ 	prtd->substream = substream;
+ 	prtd->audio_client = q6asm_audio_client_alloc(
+ 				(app_cb)event_handler, prtd);
+@@ -836,6 +848,8 @@
+ 	uint32_t idx = 0;
+ 	uint32_t size = 0;
+ 	uint32_t retries = 0;
++	unsigned long playback_flags;
++	bool running;
+ 
+ 	struct snd_pcm_runtime *runtime = substream->runtime;
+ 	struct msm_audio *prtd = runtime->private_data;
+@@ -900,20 +914,26 @@
+ 			fbytes -= xfer;
+ 			pr_debug("%s:fbytes = %lu: xfer=%d\n", __func__,
+ 				 fbytes, xfer);
+-			if (atomic_read(&prtd->start)) {
++			atomic_dec(&prtd->out_count);
++			spin_lock_irqsave(&prtd->playback_lock, playback_flags);
++			prtd->queued_size[idx] = xfer;
++			running = atomic_read(&prtd->start);
++			if (!running)
++				atomic_inc(&prtd->out_needed);
++			spin_unlock_irqrestore(&prtd->playback_lock, playback_flags);
++			if (running) {
+ 				pr_debug("%s:writing %d bytes of buffer to dsp\n",
+ 						__func__, xfer);
+ 				ret = q6asm_write(prtd->audio_client, xfer,
+ 							0, 0, NO_TIMESTAMP);
+ 				if (ret < 0) {
++					atomic_inc(&prtd->out_count);
+ 					ret = -EFAULT;
+ 					q6asm_cpu_buf_release(IN,
+ 						prtd->audio_client);
+ 					goto fail;
+ 				}
+-			} else
+-				atomic_inc(&prtd->out_needed);
+-			atomic_dec(&prtd->out_count);
++			}
+ 		}
+ 	}
+ fail:
+@@ -1146,11 +1166,8 @@
+ 	struct snd_pcm_runtime *runtime = substream->runtime;
+ 	struct msm_audio *prtd = runtime->private_data;
+ 
+-	if (prtd->pcm_irq_pos >= prtd->pcm_size)
+-		prtd->pcm_irq_pos = 0;
+-
+ 	pr_debug("pcm_irq_pos = %d\n", prtd->pcm_irq_pos);
+-	return bytes_to_frames(runtime, (prtd->pcm_irq_pos));
++	return bytes_to_frames(runtime, READ_ONCE(prtd->pcm_irq_pos));
+ }
+ 
+ static int msm_pcm_mmap(struct snd_pcm_substream *substream,
+--- a/asoc/msm-pcm-q6-v2.h
++++ b/asoc/msm-pcm-q6-v2.h
+@@ -99,6 +99,9 @@
+ 	atomic_t out_count;
+ 	atomic_t in_count;
+ 	atomic_t out_needed;
++	/* Serialize pre-RUN queue publication with the RUN callback. */
++	spinlock_t playback_lock;
++	uint32_t queued_size[PLAYBACK_MAX_NUM_PERIODS];
+ 	atomic_t eos;
+ 	int out_head;
+ 	int periods;
+--- a/dsp/q6asm.c
++++ b/dsp/q6asm.c
+@@ -2364,6 +2364,11 @@
+ 					flags);
+ 				return -EINVAL;
+ 			}
++			/* Snapshot before making the slot available to another writer.
++			 * session_lock serializes this value through the client callback.
++			 */
++			ac->write_done_size =
++				READ_ONCE(port->buf[buf_index].submitted_size);
+ 			port->buf[buf_index].used = 1;
+ 			spin_unlock_irqrestore(&port->dsp_lock, dsp_flags);
+ 
+@@ -10089,6 +10094,7 @@
+ 		write.hdr.opcode = ASM_DATA_CMD_WRITE_V2;
+ 		write.buf_addr_lsw = lower_32_bits(ab->phys);
+ 		write.buf_addr_msw = msm_audio_populate_upper_32_bits(ab->phys);
++		WRITE_ONCE(ab->submitted_size, len);
+ 		write.buf_size = len;
+ 		write.seq_id = port->dsp_buf;
+ 		write.timestamp_lsw = lsw_ts;
+@@ -10183,6 +10189,7 @@
+ 		write.hdr.opcode = ASM_DATA_CMD_WRITE_V2;
+ 		write.buf_addr_lsw = lower_32_bits(ab->phys);
+ 		write.buf_addr_msw = msm_audio_populate_upper_32_bits(ab->phys);
++		WRITE_ONCE(ab->submitted_size, len);
+ 		write.buf_size = len;
+ 		write.seq_id = port->dsp_buf;
+ 		write.timestamp_lsw = lsw_ts;
+--- a/include/dsp/q6asm-v2.h
++++ b/include/dsp/q6asm-v2.h
+@@ -173,6 +173,7 @@
+ 	uint32_t   used;
+ 	uint32_t   size;/* size of buffer */
+ 	uint32_t   actual_size; /* actual number of bytes read by DSP */
++	uint32_t   submitted_size; /* playback bytes in this DSP buffer */
+ 	void       *mem_handle;
+ };
+ 
+@@ -259,6 +260,8 @@
+ 	struct shared_io_config config;
+ 	int stream_type;
+ 	int fedai_id;
++	/* Snapshot valid during a synchronous WRITE_DONE client callback. */
++	uint32_t write_done_size;
+ };
+ 
+ struct q6asm_cal_info {

@@ -1,0 +1,225 @@
+From: Hoki local development <code@lukasrieger.com>
+Subject: [PATCH] PCM: retain capture buffers across partial reads
+
+Fulfil the entire ALSA copy request, retain unread samples, and return a
+negative error for timeout or unavailable data. Flush stopped capture streams
+before reinitializing ownership. Keep failed requeues failed until prepare.
+
+Upstream-Status: Pending
+
+--- a/asoc/msm-pcm-q6-v2.c
++++ b/asoc/msm-pcm-q6-v2.c
+@@ -607,6 +607,21 @@
+ 		}
+ 	}
+ 
++	if (prtd->enabled == STOPPED) {
++		ret = q6asm_cmd(prtd->audio_client, CMD_FLUSH);
++		if (ret < 0)
++			return ret;
++	}
++	if (prtd->enabled == IDLE || prtd->enabled == STOPPED) {
++		mutex_lock(&prtd->capture_lock);
++		prtd->capture_data = NULL;
++		prtd->capture_remaining = 0;
++		prtd->capture_error = 0;
++		atomic_set(&prtd->in_count, 0);
++		memset(prtd->in_frame_info, 0, sizeof(prtd->in_frame_info));
++		mutex_unlock(&prtd->capture_lock);
++	}
++
+ 	prtd->pcm_size = snd_pcm_lib_buffer_bytes(substream);
+ 	prtd->pcm_count = snd_pcm_lib_period_bytes(substream);
+ 	prtd->pcm_irq_pos = 0;
+@@ -615,8 +630,11 @@
+ 	prtd->channel_mode = runtime->channels;
+ 
+ 	if (prtd->enabled == IDLE || prtd->enabled == STOPPED) {
+-		for (i = 0; i < runtime->periods; i++)
+-			q6asm_read(prtd->audio_client);
++		for (i = 0; i < runtime->periods; i++) {
++			ret = q6asm_read(prtd->audio_client);
++			if (ret < 0)
++				return ret;
++		}
+ 		prtd->periods = runtime->periods;
+ 	}
+ 
+@@ -750,6 +768,7 @@
+ 	if (prtd == NULL)
+ 		return -ENOMEM;
+ 
++	mutex_init(&prtd->capture_lock);
+ 	spin_lock_init(&prtd->playback_lock);
+ 	prtd->substream = substream;
+ 	prtd->audio_client = q6asm_audio_client_alloc(
+@@ -1016,82 +1035,80 @@
+ 		 int channel, unsigned long hwoff, void __user *buf,
+ 						 unsigned long fbytes)
+ {
++	struct msm_audio *prtd = substream->runtime->private_data;
++	struct audio_port_data *port = &prtd->audio_client->port[OUT];
++	uint32_t idx, size, offset;
++	unsigned long xfer;
+ 	int ret = 0;
+-	int xfer;
+-	char *bufptr;
+-	void *data = NULL;
+-	uint32_t idx = 0;
+-	uint32_t size = 0;
+-	uint32_t offset = 0;
+-	struct snd_pcm_runtime *runtime = substream->runtime;
+-	struct msm_audio *prtd = substream->runtime->private_data;
+-
+-
+-	pr_debug("%s\n", __func__);
+-
+-	pr_debug("appl_ptr %d\n", (int)runtime->control->appl_ptr);
+-	pr_debug("hw_ptr %d\n", (int)runtime->status->hw_ptr);
+-	pr_debug("avail_min %d\n", (int)runtime->control->avail_min);
+-
+-	if (prtd->reset_event) {
+-		pr_err("%s: In SSR return ENETRESET before wait\n", __func__);
+-		return -ENETRESET;
+-	}
+-	ret = wait_event_timeout(the_locks.read_wait,
+-			(atomic_read(&prtd->in_count)),
+-			msecs_to_jiffies(TIMEOUT_MS));
+-	if (!ret) {
+-		pr_debug("%s: wait_event_timeout failed\n", __func__);
+-		goto fail;
+-	}
+-	if (prtd->reset_event) {
+-		pr_err("%s: In SSR return ENETRESET after wait\n", __func__);
+-		return -ENETRESET;
+-	}
+-	if (!atomic_read(&prtd->in_count)) {
+-		pr_debug("%s: pcm stopped in_count 0\n", __func__);
+-		return 0;
+-	}
+-	pr_debug("Checking if valid buffer is available...%pK\n",
+-						data);
+-	data = q6asm_is_cpu_buf_avail(OUT, prtd->audio_client, &size, &idx);
+-	bufptr = data;
+-	pr_debug("Size = %d\n", size);
+-	pr_debug("fbytes = %lu\n", fbytes);
+-	pr_debug("idx = %d\n", idx);
+-	if (bufptr) {
+-		xfer = fbytes;
+-		if (xfer > size)
+-			xfer = size;
+-		offset = prtd->in_frame_info[idx].offset;
+-		pr_debug("Offset value = %d\n", offset);
+-		if (copy_to_user(buf, bufptr+offset, xfer)) {
+-			pr_err("Failed to copy buf to user\n");
++
++	mutex_lock(&prtd->capture_lock);
++	while (fbytes) {
++		if (prtd->reset_event) {
++			ret = -ENETRESET;
++			break;
++		}
++		if (prtd->capture_error) {
++			ret = prtd->capture_error;
++			break;
++		}
++		if (!prtd->capture_data) {
++			ret = wait_event_timeout(the_locks.read_wait,
++				atomic_read(&prtd->in_count) || prtd->reset_event,
++				msecs_to_jiffies(TIMEOUT_MS));
++			if (prtd->reset_event) {
++				ret = -ENETRESET;
++				break;
++			}
++			if (!ret) {
++				ret = -ETIMEDOUT;
++				break;
++			}
++			prtd->capture_data = q6asm_is_cpu_buf_avail(OUT,
++				prtd->audio_client, &size, &idx);
++			if (!prtd->capture_data) {
++				ret = -EIO;
++				break;
++			}
++			if (idx >= CAPTURE_MAX_NUM_PERIODS || idx >= port->max_buf_cnt) {
++				prtd->capture_error = ret = -EIO;
++				break;
++			}
++			offset = prtd->in_frame_info[idx].offset;
++			if (!size || offset > port->buf[idx].size ||
++			    size > port->buf[idx].size - offset) {
++				prtd->capture_error = ret = -EIO;
++				break;
++			}
++			prtd->capture_index = idx;
++			prtd->capture_offset = offset;
++			prtd->capture_remaining = size;
++		}
++
++		xfer = min_t(unsigned long, fbytes, prtd->capture_remaining);
++		if (copy_to_user(buf,
++			(char *)prtd->capture_data + prtd->capture_offset, xfer)) {
+ 			ret = -EFAULT;
+-			q6asm_cpu_buf_release(OUT, prtd->audio_client);
+-			goto fail;
+-		}
++			break;
++		}
++		buf += xfer;
+ 		fbytes -= xfer;
+-		size -= xfer;
+-		prtd->in_frame_info[idx].offset += xfer;
+-		pr_debug("%s:fbytes = %lu: size=%d: xfer=%d\n",
+-					__func__, fbytes, size, xfer);
+-		pr_debug(" Sending next buffer to dsp\n");
+-		memset(&prtd->in_frame_info[idx], 0,
+-		       sizeof(struct msm_audio_in_frame_info));
+-		atomic_dec(&prtd->in_count);
+-		ret = q6asm_read(prtd->audio_client);
+-		if (ret < 0) {
+-			pr_err("q6asm read failed\n");
+-			ret = -EFAULT;
+-			q6asm_cpu_buf_release(OUT, prtd->audio_client);
+-			goto fail;
+-		}
+-	} else
+-		pr_err("No valid buffer\n");
+-
+-	pr_debug("Returning from capture_copy... %d\n", ret);
+-fail:
++		prtd->capture_offset += xfer;
++		prtd->capture_remaining -= xfer;
++		if (!prtd->capture_remaining) {
++			idx = prtd->capture_index;
++			prtd->capture_data = NULL;
++			memset(&prtd->in_frame_info[idx], 0,
++			       sizeof(prtd->in_frame_info[idx]));
++			atomic_dec(&prtd->in_count);
++			ret = q6asm_read(prtd->audio_client);
++			if (ret < 0) {
++				prtd->capture_error = ret;
++				break;
++			}
++		}
++		ret = 0;
++	}
++	mutex_unlock(&prtd->capture_lock);
+ 	return ret;
+ }
+ 
+--- a/asoc/msm-pcm-q6-v2.h
++++ b/asoc/msm-pcm-q6-v2.h
+@@ -83,6 +83,13 @@
+ 
+ 	int abort; /* set when error, like sample rate mismatch */
+ 
++	/* Retain ownership until every sample in a capture buffer is read. */
++	struct mutex capture_lock;
++	void *capture_data;
++	uint32_t capture_index;
++	uint32_t capture_offset;
++	uint32_t capture_remaining;
++	int capture_error;
+ 	bool reset_event;
+ 	int enabled;
+ 	int close_ack;

@@ -1,0 +1,61 @@
+From 1e8f5de1a1be95c695a3991c8c83d8e92c9367d4 Mon Sep 17 00:00:00 2001
+From: Frajo Haider <f_haider@gmx.at>
+Date: Sat, 9 Jul 2022 16:05:43 +0300
+Subject: [PATCH] bluebinder: simply and fix turn_on_bt/turn_off_bt.
+
+[bluebinder] simply and fix turn_on_bt/turn_off_bt. JB#51155
+
+configure_bt can be called directly here since rfkill_callback already runs
+with the same PRIORITY_RFKILL_CHANNEL priority as turn_on_bt/turn_off_bt.
+Also fix a pointer to pointer mistake in the same go.
+Upstream-Status: Backport [https://github.com/mer-hybris/bluebinder/commit/1e8f5de1a1be95c695a3991c8c83d8e92c9367d4]
+
+---
+ bluebinder.c | 24 +-----------------------
+ 1 file changed, 1 insertion(+), 23 deletions(-)
+
+diff --git a/bluebinder.c b/bluebinder.c
+index fb8fb9b..d5a0610 100644
+--- a/bluebinder.c
++++ b/bluebinder.c
+@@ -784,24 +784,6 @@ bluebinder_callbacks_transact(
+     }
+ }
+ 
+-gboolean
+-turn_off_bt(
+-    gpointer user_data)
+-{
+-    struct proxy *proxy = user_data;
+-    configure_bt(proxy, FALSE);
+-    return G_SOURCE_REMOVE;
+-}
+-
+-gboolean
+-turn_on_bt(
+-    gpointer user_data)
+-{
+-    struct proxy *proxy = user_data;
+-    configure_bt(proxy, TRUE);
+-    return G_SOURCE_REMOVE;
+-}
+-
+ static
+ gboolean
+ rfkill_callback(
+@@ -852,11 +834,7 @@ rfkill_callback(
+     }
+ 
+     if (bt_event) {
+-        if (bluetooth_on) {
+-            g_idle_add_full(PRIORITY_RFKILL_CHANNEL, turn_on_bt, &proxy, NULL);
+-        } else {
+-            g_idle_add_full(PRIORITY_RFKILL_CHANNEL, turn_off_bt, &proxy, NULL);
+-        }
++        configure_bt(proxy, bluetooth_on);
+     }
+ 
+     return G_SOURCE_CONTINUE;
+-- 
+2.54.0
+

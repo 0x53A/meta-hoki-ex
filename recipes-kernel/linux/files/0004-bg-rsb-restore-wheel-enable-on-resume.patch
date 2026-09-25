@@ -1,0 +1,127 @@
+Subject: [PATCH] soc: qcom: bg-rsb: restore wheel enable state after suspend
+
+System suspend disables the wheel GPIO/regulator before powering RSB down.
+Resume previously restored only the configured state, leaving crown rotation
+inoperative until userspace explicitly enabled it again.
+
+Remember when suspend gated an enabled wheel and restore that gate on resume.
+Preserve intentionally disabled rotation, avoid duplicate regulator enables,
+and undo the wheel gate if the power-off step fails. Keep restoration pending
+when resume fails so a retry can finish without cycling already-restored power.
+
+Upstream-Status: Pending
+
+diff --git a/drivers/soc/qcom/bg_rsb.c b/drivers/soc/qcom/bg_rsb.c
+index 156caa3fd933..cb175c1de583 100644
+--- a/drivers/soc/qcom/bg_rsb.c
++++ b/drivers/soc/qcom/bg_rsb.c
+@@ -51,6 +51,7 @@ struct bgrsb_priv {
+ 	bool is_cnfgrd;
+ 	bool blk_rsb_cmnds;
+ 	bool pending_enable;
++	bool restore_wheel_events;
+ };
+ 
+ static void *bgrsb_drv;
+@@ -850,56 +851,74 @@ static int bg_rsb_resume(struct device *pldev)
+ {
+ 	struct platform_device *pdev = to_platform_device(pldev);
+ 	struct bgrsb_priv *dev = platform_get_drvdata(pdev);
++	int ret = 0;
+ 
+ 	mutex_lock(&dev->rsb_state_mutex);
+-	if (dev->bgrsb_current_state == BGRSB_STATE_RSB_CONFIGURED)
+-		goto ret_success;
+-
+ 	if (dev->bgrsb_current_state == BGRSB_STATE_INIT) {
+-		if (dev->is_cnfgrd &&
+-		    bgrsb_set_ldo(dev, BGRSB_HW_TURN_ON) == 0) {
+-			dev->bgrsb_current_state = BGRSB_STATE_RSB_CONFIGURED;
+-			pr_debug("RSB Cofigured\n");
+-			goto ret_success;
++		if (!dev->is_cnfgrd) {
++			ret = -EINVAL;
++			goto out;
+ 		}
+-		pr_err("RSB failed to resume\n");
++		ret = bgrsb_set_ldo(dev, BGRSB_HW_TURN_ON);
++		if (ret)
++			goto out;
++		dev->bgrsb_current_state = BGRSB_STATE_RSB_CONFIGURED;
+ 	}
+-	mutex_unlock(&dev->rsb_state_mutex);
+-	return -EINVAL;
+ 
+-ret_success:
++	if (dev->bgrsb_current_state == BGRSB_STATE_RSB_CONFIGURED &&
++	    dev->restore_wheel_events) {
++		/* Suspend only gated wheel hardware; the BG command stays enabled. */
++		ret = bgrsb_set_ldo(dev, BGRSB_ENABLE_WHEEL_EVENTS);
++		if (ret)
++			goto out;
++		dev->bgrsb_current_state = BGRSB_STATE_RSB_ENABLED;
++	}
++
++	if (dev->bgrsb_current_state == BGRSB_STATE_RSB_CONFIGURED ||
++	    dev->bgrsb_current_state == BGRSB_STATE_RSB_ENABLED)
++		dev->restore_wheel_events = false;
++	else
++		ret = -EINVAL;
++out:
++	if (ret)
++		pr_err("RSB failed to resume: %d\n", ret);
+ 	mutex_unlock(&dev->rsb_state_mutex);
+-	return 0;
++	return ret;
+ }
+ 
+ static int bg_rsb_suspend(struct device *pldev)
+ {
+ 	struct platform_device *pdev = to_platform_device(pldev);
+ 	struct bgrsb_priv *dev = platform_get_drvdata(pdev);
++	int ret = 0;
+ 
+ 	mutex_lock(&dev->rsb_state_mutex);
+ 	if (dev->bgrsb_current_state == BGRSB_STATE_INIT)
+-		goto ret_success;
++		goto out;
+ 
+ 	if (dev->bgrsb_current_state == BGRSB_STATE_RSB_ENABLED) {
+-		if (bgrsb_set_ldo(dev, BGRSB_DISABLE_WHEEL_EVENTS) != 0)
+-			goto ret_err;
++		ret = bgrsb_set_ldo(dev, BGRSB_DISABLE_WHEEL_EVENTS);
++		if (ret)
++			goto out;
++		dev->restore_wheel_events = true;
++		dev->bgrsb_current_state = BGRSB_STATE_RSB_CONFIGURED;
+ 	}
+ 
+-	if (bgrsb_set_ldo(dev, BGRSB_HW_TURN_OFF) == 0) {
++	ret = bgrsb_set_ldo(dev, BGRSB_HW_TURN_OFF);
++	if (!ret) {
+ 		dev->bgrsb_current_state = BGRSB_STATE_INIT;
+-		pr_debug("RSB Init\n");
+-		goto ret_success;
++	} else if (dev->restore_wheel_events) {
++		/* A failed suspend may not get a resume callback. Undo our gate. */
++		if (!bgrsb_set_ldo(dev, BGRSB_ENABLE_WHEEL_EVENTS)) {
++			dev->bgrsb_current_state = BGRSB_STATE_RSB_ENABLED;
++			dev->restore_wheel_events = false;
++		}
+ 	}
+-
+-ret_err:
+-	pr_err("RSB failed to suspend\n");
++out:
++	if (ret)
++		pr_err("RSB failed to suspend: %d\n", ret);
+ 	mutex_unlock(&dev->rsb_state_mutex);
+-	return -EINVAL;
+-
+-ret_success:
+-	mutex_unlock(&dev->rsb_state_mutex);
+-	return 0;
++	return ret;
+ }
+ 
+ static const struct of_device_id bg_rsb_of_match[] = {

@@ -1,0 +1,101 @@
+Subject: [PATCH] nl80211: retry host SAE with RSN encoding after EINVAL
+
+Some vendor kernels expose SAE_PASSWORD but have not backported acceptance of
+NL80211_WPA_VERSION_3. Inferring version support from the attribute range then
+causes host-SAE connect requests to fail with EINVAL before driver connection.
+
+After that specific failure, retry once using the legacy RSN version encoding,
+without changing the AKM, authentication algorithm, PMF or keys. Exclude SAE
+offload and cache the compatibility choice only after an accepted request.
+Retain EALREADY recovery for either encoding. This is not a WPA2 fallback.
+
+The diagnostic RSN encoding completed SAE with PMF and traffic on Hoki. Native
+tests cover the production retry, negative guards, cache and EALREADY behavior;
+the production revision passed SAE on WPA3-only and mixed-mode APs, plus
+WPA2 compatibility, reconnect, rapid toggle and traffic checks on Hoki.
+
+Upstream-Status: Pending
+
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -6824,7 +6824,8 @@
+ 			 * NL80211_ATTR_SAE_PASSWORD is related and was added
+ 			 * at the same time as NL80211_WPA_VERSION_3.
+ 			 */
+-			if (nl80211_attr_supported(drv,
++			if (!drv->sae_legacy_rsn_version &&
++			    nl80211_attr_supported(drv,
+ 						   NL80211_ATTR_SAE_PASSWORD) &&
+ 			    wpa_key_mgmt_sae(params->key_mgmt_suite))
+ 				ver |= NL80211_WPA_VERSION_3;
+@@ -7187,18 +7188,12 @@
+ }
+ 
+ 
+-static int wpa_driver_nl80211_connect(
++static int nl80211_connect_retry_already(
+ 	struct wpa_driver_nl80211_data *drv,
+ 	struct wpa_driver_associate_params *params,
+ 	struct i802_bss *bss)
+ {
+ 	int ret;
+-
+-	/* Store the connection attempted bssid for future use */
+-	if (params->bssid)
+-		os_memcpy(drv->auth_attempt_bssid, params->bssid, ETH_ALEN);
+-	else
+-		os_memset(drv->auth_attempt_bssid, 0, ETH_ALEN);
+ 
+ 	ret = wpa_driver_nl80211_try_connect(drv, params, bss);
+ 	if (ret == -EALREADY) {
+@@ -7214,6 +7209,40 @@
+ 			    drv, WLAN_REASON_PREV_AUTH_NOT_VALID, bss))
+ 			return -1;
+ 		ret = wpa_driver_nl80211_try_connect(drv, params, bss);
++	}
++	return ret;
++}
++
++
++static int wpa_driver_nl80211_connect(
++	struct wpa_driver_nl80211_data *drv,
++	struct wpa_driver_associate_params *params,
++	struct i802_bss *bss)
++{
++	int ret;
++
++	/* Store the connection attempted bssid for future use */
++	if (params->bssid)
++		os_memcpy(drv->auth_attempt_bssid, params->bssid, ETH_ALEN);
++	else
++		os_memset(drv->auth_attempt_bssid, 0, ETH_ALEN);
++
++	ret = nl80211_connect_retry_already(drv, params, bss);
++	/* Some vendor kernels backport SAE_PASSWORD without WPA_VERSION_3.
++	 * Retry only host SAE rejected with EINVAL, preserving AKM, PMF,
++	 * auth algorithm and all key material. Never retry SAE offload here.
++	 */
++	if (ret == -EINVAL && !drv->sae_legacy_rsn_version &&
++	    (params->wpa_proto & WPA_PROTO_RSN) &&
++	    wpa_key_mgmt_sae(params->key_mgmt_suite) &&
++	    !(drv->capa.flags2 & WPA_DRIVER_FLAGS2_SAE_OFFLOAD_STA) &&
++	    nl80211_attr_supported(drv, NL80211_ATTR_SAE_PASSWORD)) {
++		drv->sae_legacy_rsn_version = 1;
++		wpa_printf(MSG_DEBUG,
++			   "nl80211: Retry host SAE using legacy RSN version encoding");
++		ret = nl80211_connect_retry_already(drv, params, bss);
++		if (ret)
++			drv->sae_legacy_rsn_version = 0;
+ 	}
+ 	return ret;
+ }
+--- a/src/drivers/driver_nl80211.h
++++ b/src/drivers/driver_nl80211.h
+@@ -174,6 +174,7 @@
+ 	unsigned int dfs_vendor_cmd_avail:1;
+ 	unsigned int have_low_prio_scan:1;
+ 	unsigned int force_connect_cmd:1;
++	unsigned int sae_legacy_rsn_version:1;
+ 	unsigned int addr_changed:1;
+ 	unsigned int get_features_vendor_cmd_avail:1;
+ 	unsigned int set_rekey_offload:1;

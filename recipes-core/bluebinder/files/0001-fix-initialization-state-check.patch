@@ -1,0 +1,28 @@
+From 5166af8d507ebf35b71d63d0eeaf9e8f65204efd Mon Sep 17 00:00:00 2001
+From: Frajo Haider <f_haider@gmx.at>
+Date: Thu, 28 Apr 2022 14:18:09 +0300
+Subject: [PATCH] bluebinder: fix parenthesis and flag.
+
+[bluebinder] fix parenthesis and flag. JB#51155
+Upstream-Status: Backport [https://github.com/mer-hybris/bluebinder/commit/5166af8d507ebf35b71d63d0eeaf9e8f65204efd]
+
+---
+ bluebinder.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/bluebinder.c b/bluebinder.c
+index 07a3ae2..fb8fb9b 100644
+--- a/bluebinder.c
++++ b/bluebinder.c
+@@ -684,7 +684,7 @@ check_bt_state(
+     memset(&zero_bdaddr, 0, sizeof(bdaddr_t));
+ 
+     if ((hci_test_bit(HCI_UP, &di.flags) && !hci_test_bit(HCI_INIT, &di.flags))
+-        || (!hci_test_bit(HCI_UP, &di.flags) && memcmp(&zero_bdaddr, &di.bdaddr, sizeof(bdaddr_t) != 0))) {
++        || (!hci_test_bit(HCI_RUNNING, &di.flags) && (memcmp(&zero_bdaddr, &di.bdaddr, sizeof(bdaddr_t)) != 0))) {
+         fprintf(stderr, "successfully initialized bluetooth\n");
+ #if USE_SYSTEMD
+         sd_notify(0, "READY=1");
+-- 
+2.54.0
+

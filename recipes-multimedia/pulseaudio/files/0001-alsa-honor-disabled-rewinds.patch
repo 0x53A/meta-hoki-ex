@@ -1,0 +1,28 @@
+From: Hoki local development <code@lukasrieger.com>
+Subject: [PATCH] alsa: advertise zero rewind when safeguard covers the buffer
+
+A safeguard covering the entire buffer prevents every hardware rewind.
+Expose that restriction to sink inputs as well, including after resume.
+
+Upstream-Status: Pending
+
+--- a/src/modules/alsa/alsa-sink.c
++++ b/src/modules/alsa/alsa-sink.c
+@@ -1156,7 +1156,7 @@
+     }
+ 
+     pa_sink_set_max_request_within_thread(u->sink, u->hwbuf_size - u->hwbuf_unused);
+-    if (pa_alsa_pcm_is_hw(u->pcm_handle))
++    if (pa_alsa_pcm_is_hw(u->pcm_handle) && u->rewind_safeguard < u->hwbuf_size)
+         pa_sink_set_max_rewind_within_thread(u->sink, u->hwbuf_size - u->hwbuf_unused);
+     else {
+         pa_log_info("Disabling rewind_within_thread for device %s", u->device_name);
+@@ -2764,7 +2764,7 @@
+                 (double) pa_bytes_to_usec(u->hwbuf_size, &ss) / PA_USEC_PER_MSEC);
+ 
+     pa_sink_set_max_request(u->sink, u->hwbuf_size);
+-    if (pa_alsa_pcm_is_hw(u->pcm_handle))
++    if (pa_alsa_pcm_is_hw(u->pcm_handle) && u->rewind_safeguard < u->hwbuf_size)
+         pa_sink_set_max_rewind(u->sink, u->hwbuf_size);
+     else {
+         pa_log_info("Disabling rewind for device %s", u->device_name);

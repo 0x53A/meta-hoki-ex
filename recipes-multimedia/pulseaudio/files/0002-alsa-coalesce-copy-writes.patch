@@ -1,0 +1,28 @@
+From: Hoki local development <code@lukasrieger.com>
+Subject: [PATCH] alsa: coalesce non-rewindable DSP copy writes
+
+Prevent short native-protocol chunks from monopolizing DSP packet slots.
+Only enable when the configured safeguard disables hardware rewinds.
+
+Upstream-Status: Inappropriate [Hoki DSP copy driver workaround]
+
+--- a/src/modules/alsa/alsa-sink.c
++++ b/src/modules/alsa/alsa-sink.c
+@@ -894,8 +894,15 @@
+ 
+ /*         pa_log_debug("%lu frames to write", (unsigned long) frames); */
+ 
+-            if (u->memchunk.length <= 0)
+-                pa_sink_render(u->sink, n_bytes, &u->memchunk);
++            if (u->memchunk.length <= 0) {
++                /* Non-rewindable DSP copy devices have bounded packet slots.
++                 * Coalesce short client chunks to avoid blocking before the
++                 * logical hardware ring is full. */
++                if (u->rewind_safeguard >= u->hwbuf_size)
++                    pa_sink_render_full(u->sink, n_bytes, &u->memchunk);
++                else
++                    pa_sink_render(u->sink, n_bytes, &u->memchunk);
++            }
+ 
+             pa_assert(u->memchunk.length > 0);
+ 
