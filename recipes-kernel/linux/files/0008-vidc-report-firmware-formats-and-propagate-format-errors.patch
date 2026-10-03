@@ -1,0 +1,40 @@
+From: Lukas Rieger <code@lukasrieger.com>
+Subject: [PATCH] media: msm: vidc: report firmware formats and propagate format errors
+
+Log supported-format entries from the firmware initialization response at
+VIDC_INFO level before discarding them. Include codec, domain and buffer
+context so the advertised formats can be examined during normal encoding.
+
+Propagate immediate input color-format submission errors from S_FMT instead
+of continuing with buffer requirements after a failed request. Successful
+submission still does not imply firmware acknowledgement or RGB support.
+
+Upstream-Status: Inappropriate [downstream diagnostic instrumentation]
+
+--- a/drivers/media/platform/msm/vidc_3x/msm_venc.c
++++ b/drivers/media/platform/msm/vidc_3x/msm_venc.c
+@@ -4273,7 +4273,9 @@
+ 		msm_venc_update_plane_count(inst, OUTPUT_PORT);
+ 		fmt->num_planes = inst->fmts[OUTPUT_PORT].num_planes;
+ 
+-		msm_comm_set_color_format(inst, HAL_BUFFER_INPUT, fmt->fourcc);
++		rc = msm_comm_set_color_format(inst, HAL_BUFFER_INPUT, fmt->fourcc);
++		if (rc)
++			goto exit;
+ 	} else {
+ 		dprintk(VIDC_ERR, "%s - Unsupported buf type: %d\n",
+ 			__func__, f->type);
+--- a/drivers/media/platform/msm/vidc_3x/hfi_response_handler.c
++++ b/drivers/media/platform/msm/vidc_3x/hfi_response_handler.c
+@@ -950,6 +950,11 @@
+ 						next_offset,
+ 						bytes_to_skip);
+ 
++				dprintk(VIDC_INFO,
++					"Firmware format: codecs=%#x domain=%#x buffer=%u format=%#x planes=%u\n",
++					codecs, domain, prop->buffer_type,
++					plane_info->format, plane_info->num_planes);
++
+ 				fmt_ptr += bytes_to_skip;
+ 				next_offset += bytes_to_skip;
+ 				num_format_entries--;

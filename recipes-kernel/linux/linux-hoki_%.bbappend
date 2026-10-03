@@ -12,3 +12,10 @@ SRC_URI:append:hoki = " file://0004-bg-rsb-restore-wheel-enable-on-resume.patch"
 SRC_URI:append:hoki = " file://0005-fg-fix-shadow-retry-results-and-count-boundaries.patch"
 SRC_URI:append:hoki = " file://0006-fg-release-cancelled-esr-wake-and-count-recovery.patch"
 SRC_URI:append:hoki = " file://0007-lpm-report-idle-and-suspend-failures-with-counters.patch"
+
+# Venus format diagnostics; VIDC_INFO logging is enabled only when requested.
+SRC_URI:append:hoki = " file://0008-vidc-report-firmware-formats-and-propagate-format-errors.patch"
+
+# Managed read-only root images and persistent application bundles.
+SRC_URI:append:hoki = " file://hoki-squashfs.cfg"
+SRC_URI:append:hoki = " file://hoki-secure-storage.cfg"
